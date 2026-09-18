@@ -1,0 +1,46 @@
+chunk,method,value,threshold,drifted,detail,auc_std,auc_ci95,seeds
+2,PSI(6 numeric features),0.03492144502909994,0.2,False,0/6 features over 0.2,,,42;7;123
+3,PSI(6 numeric features),0.023984354442856994,0.2,False,0/6 features over 0.2,,,42;7;123
+4,PSI(6 numeric features),0.01780616034613696,0.2,False,0/6 features over 0.2,,,42;7;123
+5,PSI(6 numeric features),0.021296827499938817,0.2,False,0/6 features over 0.2,,,42;7;123
+6,PSI(6 numeric features),0.024502972190811052,0.2,False,0/6 features over 0.2,,,42;7;123
+7,PSI(6 numeric features),0.02617448631329932,0.2,False,0/6 features over 0.2,,,42;7;123
+8,PSI(6 numeric features),0.01001018696864404,0.2,False,0/6 features over 0.2,,,42;7;123
+9,PSI(6 numeric features),0.0355733878893824,0.2,False,0/6 features over 0.2,,,42;7;123
+10,PSI(6 numeric features),0.007410589109975549,0.2,False,0/6 features over 0.2,,,42;7;123
+2,"PSI(categorical, worst feature)",0.00159685815414333,0.2,False,worst=Sender_bank_location,,,42;7;123
+3,"PSI(categorical, worst feature)",0.002969976390801244,0.2,False,worst=Receiver_bank_location,,,42;7;123
+4,"PSI(categorical, worst feature)",0.0023092835476124897,0.2,False,worst=Receiver_bank_location,,,42;7;123
+5,"PSI(categorical, worst feature)",0.0037576552113818156,0.2,False,worst=Receiver_bank_location,,,42;7;123
+6,"PSI(categorical, worst feature)",0.003344250484164594,0.2,False,worst=Receiver_bank_location,,,42;7;123
+7,"PSI(categorical, worst feature)",0.002647848406990318,0.2,False,worst=Receiver_bank_location,,,42;7;123
+8,"PSI(categorical, worst feature)",0.003233143797372398,0.2,False,worst=Receiver_bank_location,,,42;7;123
+9,"PSI(categorical, worst feature)",0.002075224935362431,0.2,False,worst=Receiver_bank_location,,,42;7;123
+10,"PSI(categorical, worst feature)",0.00177225357484836,0.2,False,worst=Receiver_bank_location,,,42;7;123
+2,KS(predicted probabilities),0.0029700626522248808,0.001970037975868312,True,,,,42;7;123
+2,PSI(predicted probabilities),0.00014322981703967678,0.2,False,,,,42;7;123
+3,KS(predicted probabilities),0.0017222786261750223,0.001970037975868312,False,,,,42;7;123
+3,PSI(predicted probabilities),9.629193308819859e-05,0.2,False,,,,42;7;123
+4,KS(predicted probabilities),0.00428728491243946,0.001970037975868312,True,,,,42;7;123
+4,PSI(predicted probabilities),0.0001601206425926264,0.2,False,,,,42;7;123
+5,KS(predicted probabilities),0.0018043419938241767,0.001970037975868312,False,,,,42;7;123
+5,PSI(predicted probabilities),7.369262831081069e-05,0.2,False,,,,42;7;123
+6,KS(predicted probabilities),0.0027659563275591603,0.001970037975868312,True,,,,42;7;123
+6,PSI(predicted probabilities),9.312217283925447e-05,0.2,False,,,,42;7;123
+7,KS(predicted probabilities),0.004012688259151909,0.001970037975868312,True,,,,42;7;123
+7,PSI(predicted probabilities),0.00015511287418784353,0.2,False,,,,42;7;123
+8,KS(predicted probabilities),0.0017706749711989267,0.001970037975868312,False,,,,42;7;123
+8,PSI(predicted probabilities),0.00013670494191807324,0.2,False,,,,42;7;123
+9,KS(predicted probabilities),0.002696518093394412,0.001970037975868312,True,,,,42;7;123
+9,PSI(predicted probabilities),0.0001224011231821404,0.2,False,,,,42;7;123
+10,KS(predicted probabilities),0.002153149480561223,0.0019700369395372025,True,,,,42;7;123
+10,PSI(predicted probabilities),0.00013284836077122423,0.2,False,,,,42;7;123
+2,DomainClassifier(XGB),0.5974284526748971,0.55,True,auc_std=0.002350680382534891,0.002350680382534891,0.002660045265205172,42;7;123
+3,DomainClassifier(XGB),0.6099686337448559,0.55,True,auc_std=0.007101236389289327,0.007101236389289327,0.008035805452233305,42;7;123
+4,DomainClassifier(XGB),0.5945055720164608,0.55,True,auc_std=0.005639307171973399,0.005639307171973399,0.006381476807012385,42;7;123
+5,DomainClassifier(XGB),0.605305242798354,0.55,True,auc_std=0.01830172142599161,0.01830172142599161,0.020710347432182405,42;7;123
+6,DomainClassifier(XGB),0.595396403292181,0.55,True,auc_std=0.004316804895053275,0.004316804895053275,0.004884924597668281,42;7;123
+7,DomainClassifier(XGB),0.597200962962963,0.55,True,auc_std=0.004904413946799391,0.004904413946799391,0.005549866836307888,42;7;123
+8,DomainClassifier(XGB),0.594664427983539,0.55,True,auc_std=0.007057403525869305,0.007057403525869305,0.007986203897863297,42;7;123
+9,DomainClassifier(XGB),0.611751366255144,0.55,True,auc_std=0.002405600607115266,0.002405600607115266,0.002722193349838223,42;7;123
+10,DomainClassifier(XGB),0.5844502880658436,0.55,True,auc_std=0.013449685145052327,0.013449685145052327,0.015219751504462878,42;7;123

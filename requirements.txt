@@ -1,0 +1,12 @@
+~# AML Drift Detection project (SAML-D) — dependencies
+# All phases deliberately avoid scikit-learn / scipy: metrics (ROC-AUC,
+# PR-AUC, F1, PSI, KS) are implemented manually in common.py, which also
+# sidesteps the Windows DLL load failure observed with sklearn on this
+# machine (see limitations,txt).
+#
+# Versions below are the ones the project was developed and verified with.
+
+xgboost==3.4.1
+pandas==3.0.5
+numpy==2.5.2
+matplotlib==3.11.1
