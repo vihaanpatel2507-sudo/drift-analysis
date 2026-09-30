@@ -1,11 +1,11 @@
 {
-  "threshold": 0.9600000000000001,
+  "threshold": 0.97,
   "tuned_on": "chunk_01 validation slice (20% stratified split)",
   "protocol": "F1-maximizing threshold, grid 0.01..0.99 step 0.01",
   "per_seed_thresholds": {
-    "42": 0.9600000000000001,
+    "42": 0.97,
     "7": 0.98,
-    "123": 0.9500000000000001
+    "123": 0.96
   },
   "seeds": [
     42,

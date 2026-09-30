@@ -29,8 +29,8 @@ chunk,feature,psi,drifted,threshold
 6,day_of_week,0.024502972190811052,False,0.2
 6,tx_per_sender,0.006880159636028351,False,0.2
 6,amount_per_sender_mean,0.002148264352889868,False,0.2
-7,Amount,0.0005136253833605492,False,0.2
-7,Amount_log,0.0005136253833605492,False,0.2
+7,Amount,0.0005136253833605491,False,0.2
+7,Amount_log,0.0005136253833605491,False,0.2
 7,hour_of_day,0.0002885847233367621,False,0.2
 7,day_of_week,0.02617448631329932,False,0.2
 7,tx_per_sender,0.004814493075406991,False,0.2

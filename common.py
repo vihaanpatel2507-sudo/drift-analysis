@@ -2,9 +2,13 @@
 common.py — Shared utilities for the AML Drift Detection project (SAML-D).
 
 Single source of truth for everything that used to be copy-pasted across
-phaseC/D/E/F (improvements.txt [X1]): the label encoder, chunk loading, the
-deterministic stratified split, manual metric implementations, PSI, the KS
-statistic, timestamp parsing and the decision-threshold tuner.
+phaseC/D/E/F: the label encoder, chunk loading, the deterministic stratified
+split, evaluation metrics, PSI, the KS statistic, timestamp parsing and the
+decision-threshold tuner.
+
+Metrics are provided by scikit-learn (ROC-AUC, Average Precision, F1) and
+scipy (two-sample KS test). PSI remains a custom implementation as there is
+no standard library equivalent.
 
 PICKLE COMPATIBILITY (important):
     results_phaseC/baseline_model.pkl stores SimpleLabelEncoder instances.
@@ -16,16 +20,24 @@ PICKLE COMPATIBILITY (important):
         "__main__.SimpleLabelEncoder" -> when phaseD/E/F run as scripts, the
         `from common import SimpleLabelEncoder` line puts the class into the
         script's namespace, i.e. into "__main__", so old pickles still load.
-
-No scikit-learn / scipy dependency (avoids the Windows DLL block issue).
-Uses only pandas + numpy (xgboost only needed by the phases themselves).
 """
 
 import os
+import pickle
 import re
 
+# pyrefly: ignore [missing-import]
 import numpy as np
 import pandas as pd
+from sklearn.metrics import (
+    precision_score,
+    recall_score,
+    f1_score as sklearn_f1_score,
+    roc_auc_score,
+    average_precision_score,
+)
+# pyrefly: ignore [missing-import]
+from scipy.stats import ks_2samp
 
 # -----------------------------------------------------------------------
 # Shared configuration (MUST stay identical across all phases)
@@ -173,119 +185,74 @@ def simple_train_test_split(X, y, test_size=0.2, seed=42):
     if not isinstance(y, pd.Series):
         y = pd.Series(np.asarray(y))
     rng = np.random.default_rng(seed)
-    y_arr = y.values
-    idx_pos = np.where(y_arr == 1)[0]
-    idx_neg = np.where(y_arr == 0)[0]
+    idx_pos = np.where(y.values == 1)[0]
+    idx_neg = np.where(y.values == 0)[0]
     rng.shuffle(idx_pos)
     rng.shuffle(idx_neg)
 
     n_pos_test = max(1, int(len(idx_pos) * test_size))
     n_neg_test = max(1, int(len(idx_neg) * test_size))
-
     test_idx = np.concatenate([idx_pos[:n_pos_test], idx_neg[:n_neg_test]])
     train_idx = np.concatenate([idx_pos[n_pos_test:], idx_neg[n_neg_test:]])
-
     rng.shuffle(test_idx)
     rng.shuffle(train_idx)
 
     return X.iloc[train_idx], X.iloc[test_idx], y.iloc[train_idx], y.iloc[test_idx]
 
 
+def load_baseline_bundle(model_path):
+    """
+    Load the phase C artifact (model + encoders + tuned threshold).
+    Tolerates the older format where the bare model was pickled directly.
+    """
+    with open(model_path, "rb") as f:
+        bundle = pickle.load(f)
+    if isinstance(bundle, dict) and "model" in bundle:
+        return bundle
+    return {"model": bundle, "encoders": None, "threshold": 0.5}
+
+
 # -----------------------------------------------------------------------
-# Metrics (manual implementations, no sklearn/scipy)
+# Metrics (powered by scikit-learn)
 # -----------------------------------------------------------------------
 
 def precision_recall_f1(y_true, y_pred):
-    """Returns (precision, recall, f1)."""
+    """Returns (precision, recall, f1) using sklearn."""
     y_true = np.asarray(y_true)
     y_pred = np.asarray(y_pred)
-    tp = np.sum((y_pred == 1) & (y_true == 1))
-    fp = np.sum((y_pred == 1) & (y_true == 0))
-    fn = np.sum((y_pred == 0) & (y_true == 1))
-
-    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
-    return precision, recall, f1
+    if np.sum(y_pred == 1) == 0 and np.sum(y_true == 1) == 0:
+        return 0.0, 0.0, 0.0
+    p = float(precision_score(y_true, y_pred, zero_division=0))
+    r = float(recall_score(y_true, y_pred, zero_division=0))
+    f1 = float(sklearn_f1_score(y_true, y_pred, zero_division=0))
+    return p, r, f1
 
 
 def f1_score_manual(y_true, y_pred):
+    """F1 score via sklearn (kept name for backward compatibility)."""
     _, _, f1 = precision_recall_f1(y_true, y_pred)
     return f1
 
 
-def f1_from_predictions(y_true, y_pred):
-    """Returns (f1, precision, recall)."""
-    precision, recall, f1 = precision_recall_f1(y_true, y_pred)
-    return f1, precision, recall
-
-
 def roc_auc_manual(y_true, y_score):
-    """Manual ROC-AUC via the rank-based (Mann-Whitney U) method, with ties
-    handled by averaging ranks."""
+    """ROC-AUC via sklearn.metrics.roc_auc_score."""
     y_true = np.asarray(y_true)
     y_score = np.asarray(y_score, dtype=float)
     n_pos = np.sum(y_true == 1)
     n_neg = np.sum(y_true == 0)
     if n_pos == 0 or n_neg == 0:
         return float("nan")
-
-    order = np.argsort(y_score)
-    ranks = np.empty(len(y_score))
-    ranks[order] = np.arange(1, len(y_score) + 1)
-
-    # handle ties by averaging ranks
-    sorted_scores = y_score[order]
-    sorted_ranks = ranks[order]
-    i = 0
-    while i < len(sorted_scores):
-        j = i
-        while j < len(sorted_scores) and sorted_scores[j] == sorted_scores[i]:
-            j += 1
-        if j - i > 1:
-            sorted_ranks[i:j] = sorted_ranks[i:j].mean()
-        i = j
-    ranks[order] = sorted_ranks
-
-    sum_ranks_pos = ranks[y_true == 1].sum()
-    auc = (sum_ranks_pos - n_pos * (n_pos + 1) / 2) / (n_pos * n_neg)
-    return float(auc)
+    return float(roc_auc_score(y_true, y_score))
 
 
 def average_precision_manual(y_true, y_score):
-    """
-    Standard Average Precision (AP): sum_k (R_k - R_{k-1}) * P_k.
-    In imbalanced classification, this avoids the optimistic bias of
-    linear trapezoidal interpolation on precision-recall points.
-    """
+    """Average Precision via sklearn.metrics.average_precision_score."""
     y_true = np.asarray(y_true).astype(int)
     y_score = np.asarray(y_score, dtype=float)
     n_pos = np.sum(y_true == 1)
     if n_pos == 0:
         return float("nan")
-
-    # Sort descending by score
-    order = np.argsort(-y_score)
-    y_sorted = y_true[order]
-    scores_sorted = y_score[order]
-
-    # Group ties so precision is calculated after all tied instances
-    distinct_indices = np.where(np.diff(scores_sorted))[0]
-    threshold_indices = np.concatenate([distinct_indices, [len(y_sorted) - 1]])
-
-    tps = np.cumsum(y_sorted == 1)[threshold_indices]
-    fps = np.cumsum(y_sorted == 0)[threshold_indices]
-
-    precisions = tps / (tps + fps)
-    recalls = tps / n_pos
-
-    recalls_diff = np.diff(np.concatenate([[0.0], recalls]))
-    return float(np.sum(precisions * recalls_diff))
-
-
-def pr_auc_manual(y_true, y_score):
-    """PR-AUC via standard Average Precision."""
-    return average_precision_manual(y_true, y_score)
+    return float(average_precision_score(y_true, y_score))
 
 
 def evaluate(y_true, y_pred, y_proba):
@@ -308,23 +275,23 @@ def evaluate(y_true, y_pred, y_proba):
 # Model helpers
 # -----------------------------------------------------------------------
 
-def tune_threshold(model, X_val, y_val,
-                   lo=THRESHOLD_LO, hi=THRESHOLD_HI, step=THRESHOLD_STEP):
-    """Find the F1-maximizing decision threshold for THIS model on a given
-    reference set (default 0.5 is a bad choice under extreme imbalance)."""
-    proba = model.predict_proba(X_val)[:, 1]
+def tune_threshold(y_val, proba, lo=THRESHOLD_LO, hi=THRESHOLD_HI,
+                   step=THRESHOLD_STEP):
+    """
+    Find the F1-maximizing decision threshold on already-computed scores
+    (default 0.5 is a bad choice under extreme imbalance).
+
+    Takes the scores rather than the model so callers that already predicted
+    do not pay for a second predict_proba pass.
+    """
     y_true = np.asarray(y_val)
+    proba = np.asarray(proba, dtype=float)
     best_t, best_f1 = 0.5, -1.0
     for t in np.arange(lo, hi, step):
         f1 = f1_score_manual(y_true, (proba >= t).astype(int))
         if f1 > best_f1:
             best_f1, best_t = f1, float(t)
     return best_t
-
-
-def evaluate_f1(model, threshold, X, y):
-    proba = model.predict_proba(X)[:, 1]
-    return f1_score_manual(np.asarray(y), (proba >= threshold).astype(int))
 
 
 # -----------------------------------------------------------------------
@@ -383,21 +350,18 @@ def calculate_categorical_psi(reference, current):
 
 def ks_statistic(reference, current):
     """
-    Two-sample Kolmogorov-Smirnov statistic (no scipy): the maximum absolute
-    gap between the two empirical CDFs, computed by walking the merged sorted
-    values of both samples. Used by the output-distribution detector ([D2]).
+    Two-sample Kolmogorov-Smirnov statistic via scipy.stats.ks_2samp.
+    Returns the KS statistic (maximum absolute CDF gap).
+    Used by the output-distribution detector ([D2]).
     """
-    ref = np.sort(np.asarray(reference, dtype=float))
-    cur = np.sort(np.asarray(current, dtype=float))
+    ref = np.asarray(reference, dtype=float)
+    cur = np.asarray(current, dtype=float)
     ref = ref[~np.isnan(ref)]
     cur = cur[~np.isnan(cur)]
     if len(ref) == 0 or len(cur) == 0:
         return float("nan")
-
-    data_all = np.concatenate([ref, cur])
-    cdf_ref = np.searchsorted(ref, data_all, side="right") / len(ref)
-    cdf_cur = np.searchsorted(cur, data_all, side="right") / len(cur)
-    return float(np.max(np.abs(cdf_ref - cdf_cur)))
+    stat, _pvalue = ks_2samp(ref, cur)
+    return float(stat)
 
 
 # -----------------------------------------------------------------------

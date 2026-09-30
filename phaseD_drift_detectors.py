@@ -4,30 +4,23 @@ Phase D: Unsupervised (label-free) Drift Detection (SAML-D)
 Monitors the chunk stream with detectors that need NO labels — exactly the
 production constraint (fraud labels arrive weeks late or never).
 
-Improvements implemented here (see improvements.txt):
-  [D1] HIGH  PSI is computed over a RICH SET OF DERIVED NUMERIC FEATURES,
-             not just raw "Amount": Amount, Amount_log, hour_of_day,
-             day_of_week, tx_per_sender, amount_per_sender_mean (all
-             leakage-free, computable within a single chunk). A per-feature
-             PSI table is saved so "PSI saw nothing" is inspectable.
-  [D2] HIGH  A fourth, fully label-free detector family is added:
-             OUTPUT-DISTRIBUTION MONITORING. It compares the distribution of
-             the model's predicted fraud probabilities between the reference
-             chunk and each new chunk (two-sample KS + PSI on the scores).
-             This is what real ML monitoring does when labels are missing,
-             because drift that matters shows up as a shifted prediction
-             distribution even when inputs look stable.
-  [D3] MEDIUM The domain classifier is now more robust: 3 seeds
-             (DETECTOR_SEEDS), mean +/- 95% CI reported, and a transparent
-             decision rule (AUC > 0.55 => drift signal, i.e. clearly better
-             than the 0.5 coin-flip floor).
-  [D4] MEDIUM PSI is also computed per CATEGORICAL feature (payment
-             currency, payment type, bank locations...) and saved as a
-             pivot table (chunks x features) next to the numeric one.
-  + The KS detector uses the proper two-sample critical value
-    1.358 * sqrt((n1+n2)/(n1*n2)) (alpha=0.05) instead of a guess.
-  + All detectors report a value AND an explicit threshold AND a boolean
-    'drifted' flag in one long-format CSV -> easy to consume downstream.
+Four detector families:
+  [D1] PSI over derived numeric features (Amount, Amount_log, hour_of_day,
+       day_of_week, tx_per_sender, amount_per_sender_mean) rather than raw
+       "Amount" alone — a per-feature table is saved so "PSI saw nothing"
+       stays inspectable.
+  [D2] Output-distribution monitoring: two-sample KS + PSI on the model's
+       predicted probabilities. This is what real ML monitoring falls back
+       to when labels are missing, since drift that matters shows up as a
+       shifted score distribution even when the inputs look stable.
+  [D3] Domain classifier: can a model separate reference rows from streaming
+       rows? AUC ~0.5 => indistinguishable; clearly above => drift.
+  [D4] PSI per categorical feature (currencies, bank locations, payment type),
+       saved as a chunks x features pivot next to the numeric one.
+
+NOTE ON LARGE-SAMPLE KS POWER: with N ~ 10^6 rows the alpha=0.05 critical value
+falls to ~0.002, so KS behaves as a sensitive hypothesis-rejection test while
+output PSI acts as the practical effect-size check.
 
 Outputs (results_phaseD/):
   drift_detector_results.csv   long format: chunk x method x value x drifted
@@ -38,21 +31,26 @@ Outputs (results_phaseD/):
 
 import os
 import argparse
-import pickle
 
+# pyrefly: ignore [missing-import]
 import numpy as np
+# pyrefly: ignore [missing-import]
 import pandas as pd
+# pyrefly: ignore [missing-import]
 import matplotlib
 matplotlib.use("Agg")
+# pyrefly: ignore [missing-import]
 import matplotlib.pyplot as plt
+
+# pyrefly: ignore [missing-import]
 from xgboost import XGBClassifier
 
 from common import (
     CATEGORICAL_COLS, DETECTOR_SEEDS,
     calculate_psi, calculate_categorical_psi, ks_statistic,
-    derive_psi_features, PSI_NUMERIC_FEATURES, load_chunk,
-    simple_train_test_split, roc_auc_manual, add_seed_manifest, ci95,
-    list_chunk_files,
+    derive_psi_features, PSI_NUMERIC_FEATURES, load_baseline_bundle,
+    load_chunk, simple_train_test_split, roc_auc_manual, add_seed_manifest,
+    ci95, list_chunk_files,
 )
 
 pd.set_option('display.max_columns', None)
@@ -68,16 +66,6 @@ KS_ALPHA = 0.05
 DOMAIN_SAMPLE = 15000        # per-class cap for the domain classifier
 
 
-def load_baseline(model_path=DEFAULT_MODEL_PATH):
-    """Load the phase C bundle (model + encoders + threshold)."""
-    with open(model_path, "rb") as f:
-        bundle = pickle.load(f)
-    if isinstance(bundle, dict) and "model" in bundle:
-        return bundle
-    # very old format: the raw model object was pickled directly
-    return {"model": bundle, "encoders": None, "threshold": 0.5}
-
-
 def ks_critical_value(n_ref, n_cur, alpha=KS_ALPHA):
     """
     Two-sample KS critical value at alpha=0.05.
@@ -90,18 +78,6 @@ def ks_critical_value(n_ref, n_cur, alpha=KS_ALPHA):
     """
     c_alpha = np.sqrt(-0.5 * np.log(alpha / 2.0))  # 1.358 at alpha=0.05
     return c_alpha * np.sqrt((n_ref + n_cur) / (n_ref * n_cur))
-
-
-def encode_categoricals(df, encoders):
-    """Encode the categorical columns exactly like phase C training did."""
-    out = pd.DataFrame(index=df.index)
-    for col in CATEGORICAL_COLS:
-        if col in df.columns and encoders and col in encoders:
-            le = encoders[col]
-            vals = le.transform(df[col].astype(str).tolist())
-            unseen_id = le.mapping["__UNSEEN__"]
-            out[col] = np.where(vals == -1, unseen_id, vals)
-    return out
 
 
 def run_psi_numeric(ref_feats, cur_feats, chunk_num):
@@ -138,37 +114,40 @@ def run_output_distribution(ref_probs, cur_probs, chunk_num):
     ]
 
 
-def run_domain_classifier(ref_df, cur_df, encoders, seed):
+def build_domain_matrix(df, encoders):
     """
-    [D3] One domain-classifier fit for one seed: can a model tell reference
-    rows from current-chunk rows? AUC ~ 0.5 => indistinguishable (no drift);
-    AUC clearly > 0.5 => the two distributions differ (drift).
-    Uses monitored numeric features + encoded categoricals (no IDs, no labels).
+    [D3] Feature view used by the domain classifier: the derived numeric
+    monitoring features plus the encoded categoricals. No IDs, no labels, so
+    the classifier never sees the target.
     """
-    ref_feats = derive_psi_features(ref_df)
-    cur_feats = derive_psi_features(cur_df)
-    ref_cats = encode_categoricals(ref_df, encoders)
-    cur_cats = encode_categoricals(cur_df, encoders)
+    cats = pd.DataFrame(index=df.index)
+    for col in CATEGORICAL_COLS:
+        if col in df.columns and encoders and col in encoders:
+            le = encoders[col]
+            vals = le.transform(df[col].astype(str).tolist())
+            cats[col] = np.where(vals == -1, le.mapping["__UNSEEN__"], vals)
+    return pd.concat([derive_psi_features(df), cats], axis=1)
 
-    ref_x = pd.concat([ref_feats, ref_cats], axis=1)
-    cur_x = pd.concat([cur_feats, cur_cats], axis=1)
-    feature_cols = list(ref_x.columns)
 
+def run_domain_classifier(ref_x, cur_x, seed):
+    """
+    [D3] One domain-classifier fit for one seed. The caller passes the
+    pre-built feature matrices so the expensive feature engineering is done
+    once per chunk pair, not once per seed.
+    """
     ref_x = ref_x.sample(min(DOMAIN_SAMPLE, len(ref_x)), random_state=seed)
     cur_x = cur_x.sample(min(DOMAIN_SAMPLE, len(cur_x)), random_state=seed)
 
     X_dom = pd.concat([ref_x, cur_x], axis=0, ignore_index=True)
     y_dom = pd.Series(np.concatenate([np.zeros(len(ref_x)), np.ones(len(cur_x))]))
 
-    X_tr, X_te, y_tr, y_te = simple_train_test_split(
-        X_dom[feature_cols], y_dom, test_size=0.3, seed=seed)
+    X_tr, X_te, y_tr, y_te = simple_train_test_split(X_dom, y_dom, test_size=0.3, seed=seed)
 
     clf = XGBClassifier(
         n_estimators=150, max_depth=5, learning_rate=0.1,
         eval_metric='aucpr', random_state=seed, n_jobs=-1, tree_method='hist')
     clf.fit(X_tr, y_tr)
-    proba = clf.predict_proba(X_te)[:, 1]
-    return roc_auc_manual(y_te, proba)
+    return roc_auc_manual(y_te, clf.predict_proba(X_te)[:, 1])
 
 
 def main():
@@ -184,7 +163,7 @@ def main():
     print(f"seeds for domain classifier: {DETECTOR_SEEDS}")
     print("=" * 70)
 
-    bundle = load_baseline(args.model_path)
+    bundle = load_baseline_bundle(args.model_path)
     model = bundle["model"]
     encoders = bundle.get("encoders")
 
@@ -195,13 +174,12 @@ def main():
     feats = {}  # chunk -> derived numeric features  [D1]
     probs = {}  # chunk -> model predicted probabilities [D2]
     for cnum, cf in chunk_files:
-        df = pd.read_csv(os.path.join(args.chunks_dir, cf))
-        raw[cnum] = df
-        feats[cnum] = derive_psi_features(df)
-        X, _, _ = load_chunk(os.path.join(args.chunks_dir, cf),
-                             encoders=encoders, fit_encoders=False)
+        path = os.path.join(args.chunks_dir, cf)
+        raw[cnum] = pd.read_csv(path)
+        feats[cnum] = derive_psi_features(raw[cnum])
+        X, _, _ = load_chunk(path, encoders=encoders, fit_encoders=False)
         probs[cnum] = model.predict_proba(X)[:, 1]
-        print(f"  loaded chunk {cnum:02d}: {len(df):,} rows")
+        print(f"  loaded chunk {cnum:02d}: {len(raw[cnum]):,} rows")
 
     ref_chunk = min(raw.keys())
     print(f"\nReference chunk = {ref_chunk} (training era). "
@@ -260,12 +238,14 @@ def main():
 
     # ---- [D3] domain classifier over seeds --------------------------------
     print(f"\n[D3] Domain classifier ({len(DETECTOR_SEEDS)} seeds):")
+    ref_domain = build_domain_matrix(raw[ref_chunk], encoders)
     dom_rows = []
     for cnum in sorted(raw):
         if cnum == ref_chunk:
             continue
-        aucs = np.array([run_domain_classifier(raw[ref_chunk], raw[cnum],
-                                               encoders, s)
+        # feature engineering happens once per chunk pair, not once per seed
+        cur_domain = build_domain_matrix(raw[cnum], encoders)
+        aucs = np.array([run_domain_classifier(ref_domain, cur_domain, s)
                          for s in DETECTOR_SEEDS], dtype=float)
         std = float(aucs.std(ddof=1)) if len(aucs) > 1 else np.nan
         dom_rows.append({
@@ -280,6 +260,7 @@ def main():
         print(f"  chunk {cnum:02d}: AUC={aucs.mean():.3f} "
               f"(+/- {0.0 if np.isnan(std) else std:.3f}) "
               f"drifted={aucs.mean() > DOMAIN_AUC_THRESHOLD}")
+        del cur_domain
 
     # ---- assemble the long-format results CSV ----------------------------
     summary_rows = []
@@ -326,6 +307,9 @@ def main():
 def plot_panels(psi_summary, drift_df, out_dir):
     """2x2 panel: PSI-max, KS on outputs, PSI on outputs, domain AUC."""
     fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+    for ax in axes.flat:
+        ax.set_xlabel("Chunk")
+        ax.grid(alpha=0.3)
 
     # (1) PSI over numeric features (max across features)
     ax = axes[0][0]
@@ -333,8 +317,8 @@ def plot_panels(psi_summary, drift_df, out_dir):
     ax.axhline(PSI_THRESHOLD, color="red", linestyle="--", linewidth=1,
                label=f"PSI threshold ({PSI_THRESHOLD})")
     ax.set_title("[D1] PSI - max over derived numeric features")
-    ax.set_xlabel("Chunk"); ax.set_ylabel("PSI (max)")
-    ax.legend(); ax.grid(alpha=0.3)
+    ax.set_ylabel("PSI (max)")
+    ax.legend()
 
     # (2) KS on predicted probabilities
     ks_rows = drift_df[drift_df["method"] == "KS(predicted probabilities)"]
@@ -343,8 +327,8 @@ def plot_panels(psi_summary, drift_df, out_dir):
     ax.plot(ks_rows["chunk"], ks_rows["threshold"], "r--", linewidth=1,
             label="KS critical value (alpha=0.05)")
     ax.set_title("[D2] KS on predicted probabilities")
-    ax.set_xlabel("Chunk"); ax.set_ylabel("KS statistic")
-    ax.legend(); ax.grid(alpha=0.3)
+    ax.set_ylabel("KS statistic")
+    ax.legend()
 
     # (3) PSI on predicted probabilities
     psi_out = drift_df[drift_df["method"] == "PSI(predicted probabilities)"]
@@ -352,22 +336,21 @@ def plot_panels(psi_summary, drift_df, out_dir):
     ax.bar(psi_out["chunk"], psi_out["value"], color="seagreen")
     ax.axhline(PSI_THRESHOLD, color="red", linestyle="--", linewidth=1)
     ax.set_title("[D2] PSI on predicted probabilities")
-    ax.set_xlabel("Chunk"); ax.set_ylabel("PSI (output scores)")
-    ax.grid(alpha=0.3)
+    ax.set_ylabel("PSI (output scores)")
 
     # (4) domain classifier AUC with CI
     dom = drift_df[drift_df["method"] == "DomainClassifier(XGB)"]
     ax = axes[1][1]
-    ci = dom["auc_ci95"].fillna(0).values if "auc_ci95" in dom else np.zeros(len(dom))
-    ax.bar(dom["chunk"], dom["value"], yerr=ci, capsize=3, color="indianred")
+    ax.bar(dom["chunk"], dom["value"], yerr=dom["auc_ci95"].fillna(0),
+           capsize=3, color="indianred")
     ax.axhline(0.5, color="gray", linestyle=":", linewidth=1,
                label="coin flip (0.5)")
     ax.axhline(DOMAIN_AUC_THRESHOLD, color="red", linestyle="--", linewidth=1,
                label=f"drift threshold ({DOMAIN_AUC_THRESHOLD})")
     ax.set_ylim(0.4, 1.0)
     ax.set_title("[D3] Domain classifier AUC (mean +/- 95% CI, 3 seeds)")
-    ax.set_xlabel("Chunk"); ax.set_ylabel("AUC")
-    ax.legend(); ax.grid(alpha=0.3)
+    ax.set_ylabel("AUC")
+    ax.legend()
 
     plt.suptitle("Label-free drift detection (input + output monitoring)",
                  fontsize=13)

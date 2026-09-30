@@ -12,8 +12,8 @@ Usage:
 
 import argparse
 import os
-import numpy as np
 import pandas as pd
+from common import fit_imputer, apply_imputer, parse_chunk_timestamp
 
 pd.set_option("display.max_columns", None)
 pd.set_option("display.width", 200)
@@ -56,22 +56,9 @@ def load_and_inspect(data_path):
 
 
 def parse_timestamps(df):
-    """
-    Parse true datetime with explicit format to avoid ambiguous day/month
-    inversions during temporal sorting.
-    """
-    if "Date" in df.columns and "Time" in df.columns:
-        ts_str = df["Date"].astype(str).str.strip() + " " + df["Time"].astype(str).str.strip()
-        ts = pd.to_datetime(ts_str, format="%Y-%m-%d %H:%M:%S", errors="coerce")
-        if ts.isna().mean() > 0.2:
-            ts = pd.to_datetime(ts_str, errors="coerce")
-        return ts
-
-    for col in ["__timestamp__", "Timestamp", "timestamp", "Date", "date", "Time", "time"]:
-        if col in df.columns:
-            return pd.to_datetime(df[col], errors="coerce")
-
-    return None
+    """Parse true datetime with explicit format to avoid ambiguous day/month inversions."""
+    ts = parse_chunk_timestamp(df)
+    return ts if ts.notna().any() else None
 
 
 def preprocess_and_chunk(data_path, label_col, n_chunks=10, out_dir=DEFAULT_CHUNKS_DIR):
@@ -106,28 +93,17 @@ def preprocess_and_chunk(data_path, label_col, n_chunks=10, out_dir=DEFAULT_CHUN
         pos_rate = df[label_col].mean()
         print(f"Overall positive rate: {pos_rate:.5f} ({df[label_col].sum():,} positive rows)")
 
-    # 3. Methodological improvement: fit imputation parameters STRICTLY on Chunk 1
-    # This completely eliminates look-ahead leakage across temporal chunks.
+    # 3. Fit imputation on Chunk 1 only (prevents look-ahead leakage)
     chunk_size = len(df) // n_chunks
     chunk1_ref = df.iloc[:chunk_size]
-
-    imputer_stats = {}
-    for col in df.columns:
-        if col in ["__timestamp__", label_col, "Laundering_type"]:
-            continue
-        if pd.api.types.is_numeric_dtype(df[col]):
-            med = chunk1_ref[col].dropna().median()
-            imputer_stats[col] = float(med) if pd.notna(med) else 0.0
-        elif df[col].dtype == object:
-            mode_vals = chunk1_ref[col].dropna().mode()
-            imputer_stats[col] = mode_vals.iloc[0] if not mode_vals.empty else "unknown"
+    imputer_stats = fit_imputer(chunk1_ref)
 
     print("\nFitting imputation statistics on Chunk 1 (training era) to prevent future-to-past leakage:")
     for col, fill_val in imputer_stats.items():
         n_na = int(df[col].isna().sum())
         if n_na > 0:
             print(f"  {col}: {n_na:,} missing rows filled with '{fill_val}'")
-            df[col] = df[col].fillna(fill_val)
+    df = apply_imputer(df, imputer_stats)
 
     # 4. Save sequential temporal chunks
     os.makedirs(out_dir, exist_ok=True)
@@ -142,7 +118,7 @@ def preprocess_and_chunk(data_path, label_col, n_chunks=10, out_dir=DEFAULT_CHUN
         chunk_path = os.path.join(out_dir, chunk_filename)
         chunk.to_csv(chunk_path, index=False)
 
-        info = f"rows {start:>8:,}:{end:>8:,} ({len(chunk):>7:,} rows)"
+        info = f"rows {start:>8,}:{end:>8,} ({len(chunk):>7,} rows)"
         if label_col and label_col in chunk.columns:
             pos_count = int(chunk[label_col].sum())
             pos_pct = (pos_count / len(chunk)) * 100
@@ -171,9 +147,10 @@ def main():
         print("Ensure the dataset is downloaded or specify the correct path with --data_path.")
         return
 
-    sample, label_candidates, time_candidates, total_rows = load_and_inspect(args.data_path)
+    _, label_candidates, _, _ = load_and_inspect(args.data_path)
     label_col = args.label_col or (label_candidates[0] if label_candidates else None)
-    preprocess_and_chunk(args.data_path, label_col=label_col, n_chunks=args.n_chunks, out_dir=args.out_dir)
+    preprocess_and_chunk(args.data_path, label_col=label_col,
+                         n_chunks=args.n_chunks, out_dir=args.out_dir)
 
 
 if __name__ == "__main__":

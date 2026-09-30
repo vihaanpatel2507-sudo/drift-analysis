@@ -7,37 +7,26 @@ Compares mitigation strategies against the frozen phase C baseline:
   periodic_full     every RETRAIN_EVERY chunks, retrain on ALL labeled data
                     accumulated so far (cumulative window)
   periodic_sliding  same schedule, but train only on the last WINDOW chunks
-                    ([F2] — lets the model FORGET stale patterns)
-  periodic_weighted periodic_full + positive-class up-weighting
-                    ([F3] combined weighting: scale_pos_weight is computed
-                    from the retrain window's own imbalance, then multiplied
-                    by a boost factor chosen from the [F1] sweep)
+                    (lets the model FORGET stale patterns)
+  periodic_weighted periodic_full with the positive class up-weighted
 
-Improvements implemented here (see improvements.txt):
-  [F1] HIGH  UP-WEIGHT SWEEP: instead of one magic number, a dedicated
-             experiment sweeps the positive-weight multiplier
-             w in {1, 10, 50, 100} on top of the window's natural imbalance
-             ratio (scale_pos_weight = w * neg/pos), retraining on
-             reference + the most recent labeled chunk and evaluating
-             OUT-OF-SAMPLE on the NEXT chunk. Also records fit time and
-             F1-gain-per-training-second ([F5]).
-  [F2] HIGH  Sliding-window strategy added and compared against periodic
-             full-history retraining (which cannot forget stale patterns).
-  [F4] HIGH/ Evaluation is OUT-OF-SAMPLE: a model (re)trained on chunks
-       MED   1..c-1 is evaluated on chunk c — never on the data it was fit
-             on (the old script evaluated retrained models in-sample, which
-             inflated their scores). The last chunk doubles as the "final
-             model" checkpoint (deploy-time view).
-  [F5] MED   Gain-per-second: each retrain logs its wall-clock fit time and
-             the resulting F1 delta vs the frozen baseline, so the CSV
-             answers "is retraining worth the compute?".
-  + Every retrained model gets its decision threshold re-tuned on a 20%
-    validation slice of ITS OWN retraining pool (never on the eval chunk);
-    the frozen baseline keeps the phase C threshold for fairness.
+Two experiments:
+  A: the four strategies above, evaluated OUT-OF-SAMPLE — a model trained on
+     chunks 1..c-1 is scored on chunk c, never on the data it was fit on. The
+     last chunk doubles as the deploy-time "final model" view.
+  B: a positive-weight sweep over w in {1, 10, 50, 100} applied on top of the
+     pool's natural imbalance ratio (scale_pos_weight = w * neg/pos), training
+     on reference + the most recent chunk and evaluating on the next. Each run
+     logs its wall-clock fit time and F1 gain per training second, so the CSV
+     answers "is retraining worth the compute?".
+
+Every retrained model has its decision threshold re-tuned on a 20% validation
+slice of its OWN retraining pool (never on the eval chunk); the frozen
+baseline keeps the phase C threshold for fairness.
 
 Outputs (results_phaseF/):
   retraining_results.csv        experiment A: chunk x strategy metrics
-  retraining_weight_sweep.csv   experiment B: [F1] sweep (+gain/second)
+  retraining_weight_sweep.csv   experiment B: weight sweep (+gain/second)
   retraining_summary.csv        per-strategy aggregates
   retraining_comparison_plot.png
 """
@@ -45,7 +34,6 @@ Outputs (results_phaseF/):
 import os
 import time
 import argparse
-import pickle
 
 import numpy as np
 import pandas as pd
@@ -55,9 +43,9 @@ import matplotlib.pyplot as plt
 from xgboost import XGBClassifier
 
 from common import (
-    LABEL_COL, BASELINE_SEEDS, load_chunk, simple_train_test_split,
-    evaluate, tune_threshold, f1_score_manual, add_seed_manifest,
-    list_chunk_files,
+    BASELINE_SEEDS, load_chunk, load_baseline_bundle,
+    simple_train_test_split, evaluate, tune_threshold,
+    add_seed_manifest, list_chunk_files,
 )
 
 pd.set_option('display.max_columns', None)
@@ -74,14 +62,6 @@ SPW_SWEEP = [1, 10, 50, 100]   # [F1] positive-weight multipliers
 RETRAIN_SEED = 42
 
 
-def load_baseline(model_path=DEFAULT_MODEL_PATH):
-    with open(model_path, "rb") as f:
-        bundle = pickle.load(f)
-    if isinstance(bundle, dict) and "model" in bundle:
-        return bundle
-    return {"model": bundle, "encoders": None, "threshold": 0.5}
-
-
 def fit_xgb(X_train, y_train, seed=RETRAIN_SEED, weight_mult=1.0):
     """Fit an XGBoost model; scale_pos_weight = weight_mult * neg/pos ([F3])."""
     neg = float((y_train == 0).sum())
@@ -96,18 +76,25 @@ def fit_xgb(X_train, y_train, seed=RETRAIN_SEED, weight_mult=1.0):
     return model, time.time() - t0, spw
 
 
-def retrain_with_validation(pool, seed=RETRAIN_SEED, weight_mult=1.0):
+def retrain_with_validation(X_pool, y_pool, seed=RETRAIN_SEED, weight_mult=1.0):
     """
     Train on 80% of the labeled pool, tune the threshold on the remaining
     20% (never on the upcoming eval chunk). Returns
     (model, threshold, fit_seconds, spw_used).
     """
-    X_pool, y_pool = pool
     X_tr, X_val, y_tr, y_val = simple_train_test_split(
-        X_pool, pd.Series(y_pool), test_size=0.2, seed=seed)
+        X_pool, y_pool, test_size=0.2, seed=seed)
     model, fit_s, spw = fit_xgb(X_tr, y_tr, seed=seed, weight_mult=weight_mult)
-    threshold = tune_threshold(model, X_val, y_val)
+    threshold = tune_threshold(y_val, model.predict_proba(X_val)[:, 1])
     return model, threshold, fit_s, spw
+
+
+def build_pool(encoded, chunk_nums):
+    """Concatenate the given chunks into one (X, y) retraining pool."""
+    X = pd.concat([encoded[k][0] for k in chunk_nums], axis=0, ignore_index=True)
+    y = pd.Series(pd.concat([encoded[k][1] for k in chunk_nums],
+                            axis=0, ignore_index=True))
+    return X, y
 
 
 def main():
@@ -126,7 +113,7 @@ def main():
           f"weighted_boost={WEIGHT_BOOST} sweep={SPW_SWEEP}")
     print("=" * 70)
 
-    bundle = load_baseline(args.model_path)
+    bundle = load_baseline_bundle(args.model_path)
     base_model = bundle["model"]
     encoders = bundle.get("encoders")
     base_threshold = bundle.get("threshold", 0.5)
@@ -156,33 +143,24 @@ def main():
         # --- update the adaptive strategies on their schedule -----------
         if (c - 1) % args.retrain_every == 0:
             pool_chunks = chunk_nums[: chunk_nums.index(c)]  # 1..c-1
+            X_pool, y_pool = build_pool(encoded, pool_chunks)
 
             # periodic_full: all labeled history
-            Xs = [encoded[k][0] for k in pool_chunks]
-            ys = [encoded[k][1] for k in pool_chunks]
-            X_pool = pd.concat(Xs, axis=0, ignore_index=True)
-            y_pool = pd.Series(pd.concat(ys, axis=0, ignore_index=True))
-            mdl, thr, fit_s, _spw = retrain_with_validation(
-                (X_pool, y_pool.values), weight_mult=1.0)
+            mdl, thr, fit_s, _ = retrain_with_validation(X_pool, y_pool)
             current["periodic_full"] = (mdl, thr)
             print(f"  [chunk {c:02d}] retrained periodic_full on "
                   f"{len(X_pool):,} rows ({fit_s:.1f}s)")
 
-            # periodic_sliding: last `window` chunks only [F2]
-            win_chunks = pool_chunks[-args.window:]
-            Xw = pd.concat([encoded[k][0] for k in win_chunks],
-                           axis=0, ignore_index=True)
-            yw = pd.Series(pd.concat([encoded[k][1] for k in win_chunks],
-                                     axis=0, ignore_index=True))
-            mdl, thr, fit_s, _spw = retrain_with_validation(
-                (Xw, yw.values), weight_mult=1.0)
+            # periodic_sliding: last `window` chunks only
+            X_win, y_win = build_pool(encoded, pool_chunks[-args.window:])
+            mdl, thr, fit_s, _ = retrain_with_validation(X_win, y_win)
             current["periodic_sliding"] = (mdl, thr)
             print(f"  [chunk {c:02d}] retrained periodic_sliding on "
-                  f"{len(Xw):,} rows ({fit_s:.1f}s)")
+                  f"{len(X_win):,} rows ({fit_s:.1f}s)")
 
-            # periodic_weighted: full history + combined up-weighting [F3]
-            mdl, thr, fit_s, _spw = retrain_with_validation(
-                (X_pool, y_pool.values), weight_mult=WEIGHT_BOOST)
+            # periodic_weighted: full history + up-weighted positives
+            mdl, thr, fit_s, _ = retrain_with_validation(
+                X_pool, y_pool, weight_mult=WEIGHT_BOOST)
             current["periodic_weighted"] = (mdl, thr)
             print(f"  [chunk {c:02d}] retrained periodic_weighted "
                   f"(boost={WEIGHT_BOOST}) ({fit_s:.1f}s)")
@@ -215,37 +193,32 @@ def main():
                      index=False)
 
     # ==================================================================
-    # EXPERIMENT B: [F1] positive-weight sweep, OUT-OF-SAMPLE.
-    # For each future chunk c: retrain on reference + chunk c-1 with
-    # scale_pos_weight = w * (neg/pos), evaluate on chunk c. Logs fit time
-    # and F1-gain-per-second ([F5]).
+    # EXPERIMENT B: positive-weight sweep, OUT-OF-SAMPLE. For each future
+    # chunk c: retrain on reference + chunk c-1 with scale_pos_weight =
+    # w * (neg/pos), evaluate on chunk c.
     # ==================================================================
-    print("\n--- Experiment B: up-weight sweep ([F1]) ---", flush=True)
-    X_ref, y_ref = encoded[ref_chunk]
+    print("\n--- Experiment B: up-weight sweep ---", flush=True)
     rows_B = []
     sweep_path = os.path.join(args.out_dir, "retraining_weight_sweep.csv")
+    frozen_f1 = results_A[results_A["strategy"] == "no_retrain"].set_index("chunk")["f1"]
+
     for c in chunk_nums[1:]:
-        prev = c - 1
-        X_pool = pd.concat([X_ref, encoded[prev][0]], axis=0, ignore_index=True)
-        y_pool = pd.Series(pd.concat([pd.Series(y_ref), pd.Series(encoded[prev][1])],
-                                     axis=0, ignore_index=True))
-        neg = float((y_pool == 0).sum())
-        pos = float((y_pool == 1).sum())
-        base_f1 = results_A[(results_A["chunk"] == c)
-                            & (results_A["strategy"] == "no_retrain")]["f1"].iloc[0]
+        X_pool, y_pool = build_pool(encoded, [ref_chunk, c - 1])
+        natural_ratio = (y_pool == 0).sum() / max((y_pool == 1).sum(), 1)
+        base_f1 = float(frozen_f1.loc[c])
+
         for w in SPW_SWEEP:
             print(f"  [sweep] chunk {c:02d} w={w}: fitting...", flush=True)
             model, thr, fit_s, spw = retrain_with_validation(
-                (X_pool, y_pool.values), weight_mult=float(w))
+                X_pool, y_pool, weight_mult=float(w))
             X_c, y_c = encoded[c]
             proba = model.predict_proba(X_c)[:, 1]
-            pred = (proba >= thr).astype(int)
-            m = evaluate(y_c, pred, proba)
+            m = evaluate(y_c, (proba >= thr).astype(int), proba)
             gain = m["f1"] - base_f1
             rows_B.append({
                 "chunk": c, "weight_mult": w,
                 "spw_used": spw,
-                "spw_natural_ratio": neg / max(pos, 1.0),
+                "spw_natural_ratio": natural_ratio,
                 "f1": m["f1"], "precision": m["precision"],
                 "recall": m["recall"], "roc_auc": m["roc_auc"],
                 "pr_auc": m["pr_auc"],
@@ -254,26 +227,23 @@ def main():
                 "f1_gain_per_second": gain / fit_s if fit_s > 0 else np.nan,
                 "seed": RETRAIN_SEED,
             })
-            # [robustness] persist progress after every (chunk, weight) pair
+            # persist progress after every (chunk, weight) pair so a long
+            # sweep can be inspected or resumed
             pd.DataFrame(rows_B).to_csv(sweep_path, index=False)
             print(f"  chunk {c:02d} w={w:<3}: F1={m['f1']:.4f} "
                   f"(gain {gain:+.4f}, {fit_s:.1f}s)", flush=True)
 
     results_B = pd.DataFrame(rows_B)
-    results_B.to_csv(os.path.join(args.out_dir, "retraining_weight_sweep.csv"),
-                     index=False)
+    results_B.to_csv(sweep_path, index=False)
 
     # ==================================================================
     # summary tables
     # ==================================================================
-    pivot = results_A.pivot_table(index="chunk", columns="strategy",
-                                  values="f1")
+    base_f1_by_chunk = results_A[results_A["strategy"] == "no_retrain"].set_index("chunk")["f1"]
     summary_rows = []
     for s in strategies:
         sub = results_A[results_A["strategy"] == s]
-        base = results_A[results_A["strategy"] == "no_retrain"].set_index("chunk")["f1"]
-        sub_i = sub.set_index("chunk")
-        gain = (sub_i["f1"] - base).dropna()
+        gain = (sub.set_index("chunk")["f1"] - base_f1_by_chunk).dropna()
         summary_rows.append({
             "strategy": s,
             "f1_mean_chunks2_N": sub["f1"].mean(),
@@ -305,38 +275,33 @@ def main():
 
 
 def plot_comparison(results_A, results_B, out_dir):
-    """Panel 1: F1 per chunk per strategy. Panel 2: [F1] weight sweep."""
+    """Panel 1: F1 per chunk per strategy. Panel 2: weight sweep."""
     fig, axes = plt.subplots(1, 2, figsize=(13, 5.2))
 
-    # ---- panel 1: strategies ------------------------------------------
     ax = axes[0]
     colors = {"no_retrain": "crimson", "periodic_full": "seagreen",
               "periodic_sliding": "darkorange",
               "periodic_weighted": "steelblue"}
-    for s in ["no_retrain", "periodic_full", "periodic_sliding",
-              "periodic_weighted"]:
+    for s, color in colors.items():
         sub = results_A[results_A["strategy"] == s].sort_values("chunk")
-        ax.plot(sub["chunk"], sub["f1"], marker="o", color=colors[s], label=s)
-    ax.set_xlabel("Chunk (evaluated out-of-sample)")
-    ax.set_ylabel("F1-score")
+        ax.plot(sub["chunk"], sub["f1"], marker="o", color=color, label=s)
     ax.set_title("Retraining strategies vs frozen baseline")
     ax.legend(fontsize=8)
-    ax.grid(alpha=0.3)
 
-    # ---- panel 2: weight sweep [F1] ------------------------------------
     ax = axes[1]
     for w in sorted(results_B["weight_mult"].unique()):
         sub = results_B[results_B["weight_mult"] == w].sort_values("chunk")
         ax.plot(sub["chunk"], sub["f1"], marker="s", label=f"w={w:g}")
-    ax.set_xlabel("Chunk (evaluated out-of-sample)")
-    ax.set_ylabel("F1-score")
-    ax.set_title("[F1] Positive-weight sweep (reference + prev chunk)")
+    ax.set_title("Positive-weight sweep (reference + prev chunk)")
     ax.legend(fontsize=8)
-    ax.grid(alpha=0.3)
+
+    for ax in axes:
+        ax.set_xlabel("Chunk (evaluated out-of-sample)")
+        ax.set_ylabel("F1-score")
+        ax.grid(alpha=0.3)
 
     plt.tight_layout()
-    plt.savefig(os.path.join(out_dir, "retraining_comparison_plot.png"),
-                dpi=150)
+    plt.savefig(os.path.join(out_dir, "retraining_comparison_plot.png"), dpi=150)
     plt.close()
 
 

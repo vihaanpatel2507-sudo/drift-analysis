@@ -56,18 +56,18 @@ This project investigates the full lifecycle of AML model decay and management:
 
 | Chunk | $F_1$ (Mean $\pm$ Std) | PR-AUC / AP | ROC-AUC | Positives / Total Rows |
 |:---:|:---:|:---:|:---:|:---:|
-| **1 (Train Era)** | **0.199 $\pm$ 0.018** | **0.154 $\pm$ 0.011** | **0.891** | 855 / 950,485 |
-| **2** | 0.083 $\pm$ 0.014 | 0.054 $\pm$ 0.006 | 0.716 | 936 / 950,485 |
-| **3** | 0.075 $\pm$ 0.005 | 0.051 $\pm$ 0.006 | 0.672 | 974 / 950,485 |
-| **4** | 0.100 $\pm$ 0.014 | 0.069 $\pm$ 0.002 | 0.691 | 991 / 950,485 |
-| **5** | 0.096 $\pm$ 0.008 | 0.067 $\pm$ 0.006 | 0.683 | 1,016 / 950,485 |
-| **6** | 0.072 $\pm$ 0.008 | 0.043 $\pm$ 0.007 | 0.672 | 970 / 950,485 |
-| **7** | 0.065 $\pm$ 0.007 | 0.040 $\pm$ 0.004 | 0.683 | 1,022 / 950,485 |
-| **8** | 0.064 $\pm$ 0.011 | 0.038 $\pm$ 0.006 | 0.685 | 966 / 950,485 |
-| **9** | 0.072 $\pm$ 0.008 | 0.048 $\pm$ 0.007 | 0.700 | 1,040 / 950,485 |
-| **10** | 0.105 $\pm$ 0.007 | 0.071 $\pm$ 0.005 | 0.691 | 1,103 / 950,487 |
+| **1 (Train Era)** | **0.178 $\pm$ 0.026** | **0.141** | **0.885** | 855 / 950,485 |
+| **2** | 0.083 $\pm$ 0.015 | 0.051 | 0.733 | 936 / 950,485 |
+| **3** | 0.077 $\pm$ 0.010 | 0.048 | 0.690 | 974 / 950,485 |
+| **4** | 0.104 $\pm$ 0.008 | 0.068 | 0.706 | 991 / 950,485 |
+| **5** | 0.101 $\pm$ 0.011 | 0.064 | 0.697 | 1,016 / 950,485 |
+| **6** | 0.074 $\pm$ 0.007 | 0.043 | 0.693 | 970 / 950,485 |
+| **7** | 0.064 $\pm$ 0.005 | 0.037 | 0.696 | 1,022 / 950,485 |
+| **8** | 0.053 $\pm$ 0.008 | 0.033 | 0.700 | 966 / 950,485 |
+| **9** | 0.076 $\pm$ 0.014 | 0.045 | 0.720 | 1,040 / 950,485 |
+| **10** | 0.107 $\pm$ 0.011 | 0.067 | 0.712 | 1,103 / 950,487 |
 
-**Takeaway:** As soon as future data arrives, the model suffers immediate concept drift: **$F_1$ drops by ~59% (from 0.199 down to 0.064–0.105)** and PR-AUC collapses from 0.154 to ~0.04–0.07.
+**Takeaway:** As soon as future data arrives, the model suffers immediate concept drift: **$F_1$ falls from 0.178 in the training era to 0.053–0.107 across chunks 2–10** (a 40–70% relative drop, ~54% against the future mean) and PR-AUC collapses from 0.141 to 0.033–0.068. ROC-AUC drops from 0.885 to 0.690–0.733, so the degradation is a genuine loss of ranking power, not merely a miscalibrated threshold.
 
 ---
 
@@ -83,13 +83,15 @@ This project investigates the full lifecycle of AML model decay and management:
 
 | Method | Supervised? | Detection Threshold | Alarms Fired (Chunks 2–10) | Observation |
 |---|:---:|:---:|:---:|---|
-| **Feature PSI (Numeric)** | ❌ No | $PSI > 0.20$ | **0 / 9** (Max $PSI \le 0.036$) | Input distributions appear stable |
-| **Feature PSI (Categorical)**| ❌ No | $PSI > 0.20$ | **0 / 9** (Max $PSI \le 0.004$) | Marginal category rates unchanged |
-| **Output Probabilities (KS)**| ❌ No | $\alpha = 0.05$ ($crit \approx 0.00197$) | **6 / 9** Chunks | Sensitive hypothesis test on $N \approx 10^6$ |
-| **Output Probabilities (PSI)**| ❌ No | $PSI > 0.20$ | **0 / 9** ($PSI \le 0.00016$) | Shift magnitude in scores is subtle |
+| **Feature PSI (Numeric)** | ❌ No | $PSI > 0.20$ | **0 / 9** ($PSI \le 0.036$) | Input distributions appear stable |
+| **Feature PSI (Categorical)**| ❌ No | $PSI > 0.20$ | **0 / 9** ($PSI \le 0.0038$) | Marginal category rates unchanged |
+| **Output Probabilities (KS)**| ❌ No | $\alpha = 0.05$ (per-chunk $crit \approx 0.002$) | **7 / 9** Chunks | Sensitive hypothesis test on $N \approx 10^6$ |
+| **Output Probabilities (PSI)**| ❌ No | $PSI > 0.20$ | **0 / 9** ($PSI \le 0.00019$) | Shift magnitude in scores is subtle |
 | **Domain Classifier (XGB)** | ❌ No | $\text{AUC} > 0.55$ | **9 / 9 (All Chunks)** | **Mean AUC = 0.584 – 0.612** |
 
 **Takeaway:** Standard univariate feature PSI is blind to AML drift because aggregate transactional marginals stay constant. However, the **Domain Classifier on behavioral features successfully detects drift across all 9 future chunks without requiring a single label**.
+
+**A caveat worth stating in the paper:** these five detectors do not agree. KS fires on 7/9 chunks while output PSI fires on 0/9 — at $N \approx 10^6$ the KS critical value falls to $\approx 0.002$, so it rejects on differences that are statistically detectable but practically negligible ($PSI \le 0.00019$). KS is therefore a *sensitivity* test, not an *effect-size* test, and the two together bracket the honest answer.
 
 ---
 
@@ -98,21 +100,23 @@ This project investigates the full lifecycle of AML model decay and management:
 * **Methodology:**
   * Evaluated performance across label availability budgets: **100%, 50%, 10%, 5%, 1%, 0.1%** (3 random seeds per budget).
   * **Matched No-Drift Control:** The identical label budget sweep was evaluated on an unseen held-out slice of **Chunk 1**, where no drift exists.
+  * A budget is only reported as a comparison when **all 3 control seeds produced a usable score**. Where they did not, the ratio is left blank rather than being computed against a starved or zero-scoring control.
 
 #### Future Stream vs. No-Drift Control:
 
-| Label Availability | Mean $F_1$ (Drifted Future Chunks 2–10) | No-Drift Control $F_1$ (Chunk 1 Holdout) | Valid Positives Available |
-|:---:|:---:|:---:|:---:|
-| **100%** | **0.089** | **0.232** | ~850–1,100 |
-| **50%** | **0.088** | **0.223** | ~420–550 |
-| **10%** | **0.093** | **0.180** | ~85–110 |
-| **5%** | **0.099** | **0.197** | ~45–55 |
-| **1%** | **0.127** (high variance) | **0.129** (high variance) | ~9–11 |
-| **0.1%** | *Insufficient Positives* | *Insufficient Positives* | $<3$ |
+| Label Availability | Mean $F_1$ (Drifted Future Chunks 2–10) | No-Drift Control $F_1$ (Chunk 1 Holdout) | Future / Control | Comparable? |
+|:---:|:---:|:---:|:---:|:---:|
+| **100%** | **0.092** | **0.170** | **0.54** | ✅ 3/3 seeds |
+| **50%** | **0.094** | **0.184** | **0.51** | ✅ 3/3 seeds |
+| **10%** | **0.088** | **0.166** | **0.53** | ✅ 3/3 seeds |
+| **5%** | **0.075** | **0.131** | **0.57** | ✅ 3/3 seeds |
+| **1%** | 0.114 (3/3 seeds) | — (only 1/3 control seeds scored) | — | ❌ not comparable |
+| **0.1%** | *Insufficient Positives* | *Insufficient Positives* | — | ❌ not measurable |
 
 **Takeaways:**
-1. **Decay is Genuine Drift:** At every reliable label budget (100% down to 5%), the drifted future stream scores less than half of the no-drift control (~0.09 vs ~0.20–0.23). The drop is not a small-sample illusion.
-2. **Measurement Breakdown:** Below 1% label availability, the number of observed positive transactions drops below 10, causing severe metric variance and false alarms.
+1. **Decay is Genuine Drift:** At every budget where the measurement is trustworthy (100% down to 5%), the drifted future stream scores only **51–57%** of the no-drift control (0.075–0.094 vs 0.131–0.184). The drop is not a small-sample illusion.
+2. **Label scarcity is cheap; drift is expensive:** the drifted stream's $F_1$ is essentially flat from 100% down to 5% labels (0.092 → 0.075, overlapping 95% CIs), so losing labels costs almost nothing in *measuring* decay. Running out of labels mainly blocks *repairing* it.
+3. **Measurement breaks below 5%, and we say so rather than improvise a number.** At 1% availability only ~10 positives are visible per chunk, and 2 of the 3 control runs found too few positives to score at all — so the arms cannot be compared. At 0.1% (≈1 positive per chunk) nothing is measurable in either arm. An earlier aggregation averaged over the surviving runs only, which made the starved 1% control render as a clean `0.0000` and the ratio as a spurious `0.98`; `control_n_runs_valid` in the summary CSV now records how many runs actually contributed, and the plot shades this region as unmeasurable rather than drawing a curve to zero.
 
 ---
 
@@ -132,27 +136,35 @@ This project investigates the full lifecycle of AML model decay and management:
 
 | Strategy | Mean $F_1$ (Chunks 2–10) | Final Chunk $F_1$ (Chunk 10) | Mean PR-AUC | Mean Recall |
 |---|:---:|:---:|:---:|:---:|
-| `no_retrain` (Frozen Baseline) | 0.0887 | 0.1120 | 0.0595 | 0.0625 |
-| `periodic_full` (All History) | **0.1139 (+28% gain)** | **0.1551** | **0.0723** | **0.0655** |
-| `periodic_sliding` (Window = 2) | 0.1059 (+19% gain) | 0.1346 | 0.0666 | 0.0648 |
-| `periodic_weighted` (10x Boost) | 0.0298 (Severely Degraded) | 0.0232 | 0.0659 | 0.2283 |
+| `no_retrain` (Frozen Baseline) | 0.0916 | 0.1180 | 0.0555 | 0.0528 |
+| `periodic_full` (All History) | **0.1144 (+28% gain)** | **0.1551** | **0.0719** | **0.0646** |
+| `periodic_sliding` (Window = 2) | 0.1065 (+19% gain) | 0.1346 | 0.0661 | 0.0638 |
+| `periodic_weighted` (10x Boost) | 0.0303 (Severely Degraded) | 0.0232 | 0.0656 | 0.2274 |
 
-#### Class Weight Multiplier Sweep ($w \in \{1, 10, 50, 100\}$):
-* **$w=1$ (Natural Imbalance Ratio):** Consistently achieved the highest $F_1$ on every single chunk.
-* **$w > 1$ (Aggressive Up-Weighting):** While recall increased (up to 0.50+), precision collapsed to $<0.01$, driving $F_1$ down to ~0.003–0.020. Artificially boosting positive weights severely damages precision in extreme imbalance.
+#### Class Weight Multiplier Sweep ($w \in \{1, 10, 50, 100\}$), mean over chunks 2–10:
 
-**Takeaway:** Periodic full-history retraining delivers a solid **+28% relative $F_1$ recovery** out-of-sample, while sliding-window retraining offers a scalable alternative (+19%). However, retraining cannot fully restore training-era efficacy (0.199), confirming that concept drift in AML alters the underlying conditional distribution $P(Y|X)$.
+| $w$ | Mean $F_1$ | Mean Precision | Mean Recall | Beats the other $w$ on | Beats frozen baseline on |
+|:---:|:---:|:---:|:---:|:---:|:---:|
+| **1** | **0.1004** | **0.5470** | 0.0579 | **9 / 9 chunks** | 7 / 9 chunks |
+| 10 | 0.0212 | 0.0112 | 0.2116 | 0 / 9 | 0 / 9 |
+| 50 | 0.0076 | 0.0038 | 0.4134 | 0 / 9 | 0 / 9 |
+| 100 | 0.0032 | 0.0016 | 0.5588 | 0 / 9 | 0 / 9 |
+
+* **$w=1$ (natural imbalance ratio)** achieves the highest $F_1$ of the four multipliers on **every** chunk. Note that this is a comparison *among the $w$ variants*; $w=1$ still trails the frozen Phase C baseline on chunks 2, 3 and 7, so plain retraining at $w=1$ beats re-weighting but does not beat retraining with the full `periodic_full` protocol (which re-tunes the decision threshold and pools every accumulated chunk).
+* **$w > 1$** buys recall (0.058 → 0.559) and pays for it in precision (0.547 → 0.0016), so $F_1$ falls monotonically. Up-weighting a class that is 1-in-1,000 does not make the model better at ranking; it moves the decision threshold far enough that precision collapses.
+
+**Takeaway:** Periodic full-history retraining delivers a solid **+28% relative $F_1$ recovery** out-of-sample, while sliding-window retraining offers a scalable alternative (+19%). However, retraining cannot fully restore training-era efficacy (0.178), confirming that concept drift in AML alters the underlying conditional distribution $P(Y|X)$. Note also that the $w>1$ runs still score *better* PR-AUC than the frozen baseline — the damage is confined to the thresholded decision, not the underlying score quality.
 
 ---
 
 ## 4. How to Run the Experiments
 
 ### Prerequisites
-Install dependencies (Python 3.9+):
+Install dependencies (**Python 3.12+** — `numpy` and `xgboost` both require it):
 ```bash
-pip install pandas numpy xgboost matplotlib
+pip install -r requirements.txt
 ```
-*(No `scikit-learn` or `scipy` required; all metrics and splits are implemented in `common.py` to prevent platform-specific DLL conflicts).*
+*Metrics (ROC-AUC, PR-AUC, precision/recall/F1) come from `scikit-learn`; the two-sample KS test comes from `scipy`; PSI is a custom implementation in `common.py`. The label encoder and the stratified split are hand-written to keep the pipeline deterministic and dependency-light.*
 
 ### Execution Pipeline (In Order):
 ```bash
@@ -170,6 +182,9 @@ python phaseE_label_scarcity.py
 
 # 5. Run out-of-sample retraining and weight-sweep adaptation
 python phaseF_retraining.py
+
+# 6. Generate publication comparison charts (saves to results_maincomparsion/)
+python generate_hero_chart.py
 ```
 
 ---
@@ -184,6 +199,17 @@ python phaseF_retraining.py
 ├── phaseD_drift_detectors.py      # Unsupervised PSI, KS, and Domain Classifier detectors
 ├── phaseE_label_scarcity.py       # Core experiment: label scarcity vs no-drift control
 ├── phaseF_retraining.py           # Out-of-sample retraining (full, sliding, weight sweep)
+├── generate_hero_chart.py         # 4-panel publication hero chart generator
+├── check_chunk_balance.py         # Sanity check: class balance per temporal chunk
+├── inspect_chunk.py               # Sanity check: schema/values of a single chunk
+├── run_all.sh                     # End-to-end pipeline runner
+├── RESULTS_EXPLAINED.md           # Comprehensive findings & paper writeup guide
+├── results_phaseC/                # Baseline decay metrics & CSV tables
+├── results_phaseD/                # Drift detector outputs (PSI, KS, Domain Classifier)
+├── results_phaseE/                # Label scarcity vs no-drift control evaluations
+├── results_phaseF/                # Adaptation results & class weight sweeps
+└── results_maincomparsion/        # Publication-ready retraining comparison figures (PNG/PDF)
+├── run_all.sh                     # Full B->F re-run: backs up results, then runs every phase in order
 ├── results_explained.txt          # Quick-reference numerical explanation of all phases
 ├── results_phaseC/                # Decay tables, validation metrics, threshold JSON, plots
 ├── results_phaseD/                # Detector results, PSI per feature, categorical pivot, plots

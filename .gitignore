@@ -1,0 +1,19 @@
+# Data chunks (large files > 100MB)
+chunks/
+*.csv.gz
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Caches and temporary files
+.cache/
+.DS_Store
+*.swp
+*.swo
+
+# Virtual environments
+venv/
+.venv/
+env/

@@ -6,19 +6,20 @@ the decision threshold on a held-out stratified validation slice, and evaluates
 the frozen model across subsequent chunks to measure concept drift decay.
 
 Uses multi-seed execution (default seeds: 42, 7, 123) and reports mean +/- 95% CI.
-No scikit-learn / scipy dependencies (uses common.py).
 """
 
 import argparse
-import glob
 import json
 import os
 import pickle
+
+# pyrefly: ignore [missing-import]
 import matplotlib
 matplotlib.use("Agg")
+# pyrefly: ignore [missing-import]
 import matplotlib.pyplot as plt
-import numpy as np
 import pandas as pd
+# pyrefly: ignore [missing-import]
 from xgboost import XGBClassifier
 
 from common import (
@@ -44,13 +45,11 @@ def train_baseline_for_seed(chunk_1_path, seed):
     X1, y1, encoders = load_chunk(chunk_1_path, fit_encoders=True)
     X_train, X_val, y_train, y_val = simple_train_test_split(X1, y1, test_size=0.2, seed=seed)
 
-    scale_pos_weight = (y_train == 0).sum() / max((y_train == 1).sum(), 1)
-
     model = XGBClassifier(
         n_estimators=300,
         max_depth=6,
         learning_rate=0.05,
-        scale_pos_weight=scale_pos_weight,
+        scale_pos_weight=(y_train == 0).sum() / max((y_train == 1).sum(), 1),
         eval_metric="aucpr",
         random_state=seed,
         n_jobs=-1,
@@ -59,17 +58,11 @@ def train_baseline_for_seed(chunk_1_path, seed):
     model.fit(X_train, y_train)
 
     val_proba = model.predict_proba(X_val)[:, 1]
-    best_threshold = tune_threshold(model, X_val, y_val)
-    val_pred = (val_proba >= best_threshold).astype(int)
-    val_metrics = evaluate(y_val.values, val_pred, val_proba)
+    threshold = tune_threshold(y_val, val_proba)
+    val_metrics = evaluate(y_val.values, (val_proba >= threshold).astype(int), val_proba)
+    val_metrics.update(seed=seed, threshold=threshold, n_val=len(y_val))
 
-    val_metrics.update({
-        "seed": seed,
-        "threshold": best_threshold,
-        "n_val": len(y_val),
-    })
-
-    return model, encoders, best_threshold, val_metrics
+    return model, encoders, threshold, val_metrics
 
 
 def evaluate_stream(model, encoders, threshold, chunk_files, seed):
@@ -138,7 +131,6 @@ def main():
 
         seed_results = evaluate_stream(model, encoders, threshold, chunk_files, seed=seed)
         all_seed_results.extend(seed_results)
-
         for r in seed_results:
             print(f"  Chunk {r['chunk']:02d}: F1={r['f1']:.4f} | PR-AUC={r['pr_auc']:.4f} | "
                   f"ROC-AUC={r['roc_auc']:.4f} (Positives: {r['n_positives']})")
@@ -163,23 +155,20 @@ def main():
         json.dump(threshold_meta, f_th, indent=2)
 
     # 4. Compute and save summary table (mean, std, 95% CI)
-    summary_rows = []
     n_seeds = len(args.seeds)
+    summary_rows = []
     for cnum in sorted(results_df["chunk"].unique()):
         sub = results_df[results_df["chunk"] == cnum]
-        f1_mean = float(sub["f1"].mean())
-        f1_std = float(sub["f1"].std(ddof=1)) if len(sub) > 1 else 0.0
-        pr_mean = float(sub["pr_auc"].mean())
-        pr_std = float(sub["pr_auc"].std(ddof=1)) if len(sub) > 1 else 0.0
-
+        f1_std = float(sub["f1"].std(ddof=1)) if n_seeds > 1 else 0.0
+        pr_std = float(sub["pr_auc"].std(ddof=1)) if n_seeds > 1 else 0.0
         summary_rows.append({
             "chunk": cnum,
-            "f1_mean": f1_mean,
+            "f1_mean": float(sub["f1"].mean()),
             "f1_std": f1_std,
             "precision_mean": float(sub["precision"].mean()),
             "recall_mean": float(sub["recall"].mean()),
             "roc_auc_mean": float(sub["roc_auc"].mean()),
-            "pr_auc_mean": pr_mean,
+            "pr_auc_mean": float(sub["pr_auc"].mean()),
             "pr_auc_std": pr_std,
             "n_positives": float(sub["n_positives"].iloc[0]),
             "n_rows": float(sub["n_rows"].iloc[0]),

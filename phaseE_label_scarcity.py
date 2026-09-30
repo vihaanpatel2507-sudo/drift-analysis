@@ -16,19 +16,21 @@ Gracefully handles positive starvation (< 3 positives) as NaN.
 
 import argparse
 import os
-import pickle
+# pyrefly: ignore [missing-import]
 import matplotlib
 matplotlib.use("Agg")
+# pyrefly: ignore [missing-import]
 import matplotlib.pyplot as plt
+# pyrefly: ignore [missing-import]
 import numpy as np
 import pandas as pd
 
 from common import (
     BASELINE_SEEDS,
     load_chunk,
+    load_baseline_bundle,
     simple_train_test_split,
     evaluate,
-    f1_score_manual,
     ci95,
     add_seed_manifest,
     list_chunk_files,
@@ -41,14 +43,53 @@ DEFAULT_OUT_DIR = "results_phaseE"
 
 LABEL_FRACTIONS = [1.0, 0.5, 0.1, 0.05, 0.01, 0.001]
 MIN_POSITIVES = 3
-DRIFT_F1_DROP_THRESHOLD = 0.03
 
 
-def load_baseline_bundle(phase_c_dir):
-    model_path = os.path.join(phase_c_dir, "baseline_model.pkl")
-    with open(model_path, "rb") as f:
-        bundle = pickle.load(f)
-    return bundle
+def score_budget(model, threshold, X, y):
+    """
+    Score one label budget. Returns a flat result dict, or all-NaN metrics
+    with an explanatory note when too few positives are visible to measure
+    anything (we report the gap rather than a fake zero).
+    """
+    record = {"n_available": len(y), "n_positives_available": int(y.sum())}
+    if record["n_positives_available"] < MIN_POSITIVES:
+        return {**record, "f1": np.nan, "precision": np.nan, "recall": np.nan,
+                "roc_auc": np.nan, "pr_auc": np.nan,
+                "note": f"insufficient positives (<{MIN_POSITIVES})"}
+
+    proba = model.predict_proba(X)[:, 1]
+    m = evaluate(y.values, (proba >= threshold).astype(int), proba)
+    return {**record, "f1": m["f1"], "precision": m["precision"],
+            "recall": m["recall"], "roc_auc": m["roc_auc"], "pr_auc": m["pr_auc"],
+            "note": ""}
+
+
+def summarize_runs(df):
+    """
+    Collapse repeated runs (one per seed) into a mean/std plus a count of how
+    many runs actually produced a score.
+
+    A budget where most runs were starved of positives is NOT a measurement of
+    zero performance — it is a failure to measure. Reporting mean(0, nan) as
+    0.0 would silently turn "we could not tell" into "the model scored
+    nothing", so we always carry n_runs_valid alongside the mean and leave the
+    mean as NaN when nothing was measurable.
+    """
+    rows = []
+    for frac, grp in df.groupby("fraction"):
+        vals = grp["f1"].dropna()
+        n_valid = int(len(vals))
+        std = float(vals.std(ddof=1)) if n_valid > 1 else (0.0 if n_valid == 1 else np.nan)
+        rows.append({
+            "fraction": frac,
+            "control_f1_mean": float(vals.mean()) if n_valid else np.nan,
+            "control_f1_std": std,
+            "control_f1_ci95": ci95(std, n_valid),
+            "control_pr_auc_mean": float(grp["pr_auc"].mean(skipna=True))
+            if grp["pr_auc"].notna().any() else np.nan,
+            "control_n_runs_valid": n_valid,
+        })
+    return pd.DataFrame(rows)
 
 
 def get_reference_f1(phase_c_dir):
@@ -95,42 +136,9 @@ def run_no_drift_control(model, threshold, chunk_1_path, encoders, seeds):
     for frac in LABEL_FRACTIONS:
         for seed in seeds:
             Xs, ys = sample_with_budget(X_holdout, y_holdout, frac, seed=seed)
-            n_pos = int(ys.sum())
-            n_avail = len(ys)
-
-            if n_pos < MIN_POSITIVES:
-                control_results.append({
-                    "fraction": frac,
-                    "seed": seed,
-                    "n_available": n_avail,
-                    "n_positives_available": n_pos,
-                    "f1": np.nan,
-                    "precision": np.nan,
-                    "recall": np.nan,
-                    "roc_auc": np.nan,
-                    "pr_auc": np.nan,
-                    "threshold_used": threshold,
-                    "note": f"insufficient positives (<{MIN_POSITIVES})",
-                })
-                continue
-
-            proba = model.predict_proba(Xs)[:, 1]
-            pred = (proba >= threshold).astype(int)
-            m = evaluate(ys.values, pred, proba)
-
-            control_results.append({
-                "fraction": frac,
-                "seed": seed,
-                "n_available": n_avail,
-                "n_positives_available": n_pos,
-                "f1": m["f1"],
-                "precision": m["precision"],
-                "recall": m["recall"],
-                "roc_auc": m["roc_auc"],
-                "pr_auc": m["pr_auc"],
-                "threshold_used": threshold,
-                "note": "",
-            })
+            control_results.append({"fraction": frac, "seed": seed,
+                                    "threshold_used": threshold,
+                                    **score_budget(model, threshold, Xs, ys)})
 
     return pd.DataFrame(control_results)
 
@@ -153,7 +161,8 @@ def main():
     print("=" * 70)
 
     # 1. Load trained baseline model and reference F1
-    bundle = load_baseline_bundle(args.phase_c_dir)
+    bundle = load_baseline_bundle(os.path.join(args.phase_c_dir,
+                                              "baseline_model.pkl"))
     model = bundle["model"]
     encoders = bundle["encoders"]
     threshold = bundle.get("threshold", 0.5)
@@ -174,11 +183,7 @@ def main():
     control_df = run_no_drift_control(model, threshold, chunk_1_path, encoders, seeds=args.seeds)
     control_df.to_csv(os.path.join(args.out_dir, "no_drift_control_results.csv"), index=False)
 
-    ctrl_summary = control_df.groupby("fraction").agg(
-        control_f1_mean=("f1", "mean"),
-        control_f1_std=("f1", "std"),
-        control_pr_auc_mean=("pr_auc", "mean")
-    ).reset_index()
+    ctrl_summary = summarize_runs(control_df)
 
     # 4. Run Label Scarcity Sweep across stream chunks (Chunk 1 to N)
     print("\n--- Running Label Scarcity Across Streaming Chunks ---")
@@ -190,65 +195,28 @@ def main():
         for frac in LABEL_FRACTIONS:
             for seed in args.seeds:
                 Xs, ys = sample_with_budget(X_chunk, y_chunk, frac, seed=seed)
-                n_pos = int(ys.sum())
-                n_avail = len(ys)
+                all_results.append({"chunk": cnum, "fraction": frac, "seed": seed,
+                                    **score_budget(model, threshold, Xs, ys)})
 
-                if n_pos < MIN_POSITIVES:
-                    all_results.append({
-                        "chunk": cnum,
-                        "fraction": frac,
-                        "seed": seed,
-                        "n_available": n_avail,
-                        "n_positives_available": n_pos,
-                        "f1": np.nan,
-                        "precision": np.nan,
-                        "recall": np.nan,
-                        "roc_auc": np.nan,
-                        "pr_auc": np.nan,
-                        "note": f"insufficient positives (<{MIN_POSITIVES})",
-                    })
-                    continue
-
-                proba = model.predict_proba(Xs)[:, 1]
-                pred = (proba >= threshold).astype(int)
-                m = evaluate(ys.values, pred, proba)
-
-                all_results.append({
-                    "chunk": cnum,
-                    "fraction": frac,
-                    "seed": seed,
-                    "n_available": n_avail,
-                    "n_positives_available": n_pos,
-                    "f1": m["f1"],
-                    "precision": m["precision"],
-                    "recall": m["recall"],
-                    "roc_auc": m["roc_auc"],
-                    "pr_auc": m["pr_auc"],
-                    "note": "",
-                })
-
-        # Print progress for this chunk at 100% and 5%
-        c_sub = [r for r in all_results if r["chunk"] == cnum and r["fraction"] == 1.0]
-        c_f1 = np.mean([r["f1"] for r in c_sub]) if c_sub else np.nan
-        print(f"  Chunk {cnum:02d}: Full F1={c_f1:.4f}")
+        # Print progress for this chunk at the full-label budget
+        c_f1 = [r["f1"] for r in all_results
+                if r["chunk"] == cnum and r["fraction"] == 1.0]
+        print(f"  Chunk {cnum:02d}: Full F1={np.mean(c_f1):.4f}")
 
     results_df = pd.DataFrame(all_results)
     results_df.to_csv(os.path.join(args.out_dir, "label_scarcity_results.csv"), index=False)
 
     # 5. Build Comprehensive Summary Table
+    ctrl_by_frac = ctrl_summary.set_index("fraction")
     summary_list = []
-    n_seeds = len(args.seeds)
-
     for (cnum, frac), grp in results_df.groupby(["chunk", "fraction"]):
         f1_vals = grp["f1"].dropna()
+        f1_std = float(f1_vals.std(ddof=1)) if len(f1_vals) > 1 else (
+            0.0 if len(f1_vals) == 1 else np.nan)
+        ctrl = ctrl_by_frac.loc[frac] if frac in ctrl_by_frac.index else None
+        ctrl_f1 = float(ctrl["control_f1_mean"]) if ctrl is not None else np.nan
+        ctrl_valid = int(ctrl["control_n_runs_valid"]) if ctrl is not None else 0
         f1_mean = float(f1_vals.mean()) if not f1_vals.empty else np.nan
-        f1_std = float(f1_vals.std(ddof=1)) if len(f1_vals) > 1 else (0.0 if len(f1_vals) == 1 else np.nan)
-
-        ctrl_row = ctrl_summary[ctrl_summary["fraction"] == frac]
-        c_f1_m = float(ctrl_row["control_f1_mean"].iloc[0]) if not ctrl_row.empty else np.nan
-        c_f1_s = float(ctrl_row["control_f1_std"].iloc[0]) if not ctrl_row.empty else np.nan
-        c_pr_m = float(ctrl_row["control_pr_auc_mean"].iloc[0]) if not ctrl_row.empty else np.nan
-
         summary_list.append({
             "chunk": cnum,
             "fraction": frac,
@@ -261,14 +229,35 @@ def main():
             "n_positives_available": float(grp["n_positives_available"].mean()),
             "n_runs_valid": float(len(f1_vals)),
             "f1_ci95": ci95(f1_std, len(f1_vals)),
-            "control_f1_mean": c_f1_m,
-            "control_f1_std": c_f1_s,
-            "control_pr_auc_mean": c_pr_m,
+            "control_f1_mean": ctrl_f1,
+            "control_f1_std": float(ctrl["control_f1_std"]) if ctrl is not None else np.nan,
+            "control_f1_ci95": float(ctrl["control_f1_ci95"]) if ctrl is not None else np.nan,
+            "control_pr_auc_mean": float(ctrl["control_pr_auc_mean"]) if ctrl is not None else np.nan,
+            "control_n_runs_valid": float(ctrl_valid),
+            # A ratio is only meaningful when BOTH arms produced a real score.
+            # Comparing against a starved or zero-scoring control would invent a
+            # number that says nothing about drift.
+            "future_over_control": (f1_mean / ctrl_f1
+                                    if (ctrl_valid == len(args.seeds) and ctrl_f1
+                                        and ctrl_f1 == ctrl_f1 and f1_mean == f1_mean)
+                                    else np.nan),
         })
 
     summary_df = pd.DataFrame(summary_list)
     summary_df = add_seed_manifest(summary_df, args.seeds)
     summary_df.to_csv(os.path.join(args.out_dir, "label_scarcity_summary.csv"), index=False)
+
+    # Tell the user plainly which budgets are trustworthy, rather than letting
+    # them discover it by reading NaNs out of the CSV.
+    print("\nLabel budgets by how many seeds produced a usable score:")
+    for _, r in summary_df[summary_df["chunk"] >= 2].groupby("fraction").agg(
+            valid=("n_runs_valid", "first"),
+            ctrl_valid=("control_n_runs_valid", "first"),
+            ratio=("future_over_control", "mean")).reset_index().iterrows():
+        status = "trustworthy" if r["ctrl_valid"] == len(args.seeds) and r["valid"] == len(args.seeds) \
+            else "NOT comparable — starved of positives"
+        print(f"  {r['fraction'] * 100:>6g}% labels: future {int(r['valid'])}/{len(args.seeds)} runs, "
+              f"control {int(r['ctrl_valid'])}/{len(args.seeds)} runs — {status}")
 
     # 6. Generate Publication Plot
     plot_path = os.path.join(args.out_dir, "label_scarcity_degradation_plot.png")
@@ -277,13 +266,30 @@ def main():
     # Panel 1: Future chunks vs No-Drift Control across label budgets
     future_summary = summary_df[summary_df["chunk"] >= 2].groupby("fraction").agg(
         future_f1=("f1_mean", "mean"),
-        control_f1=("control_f1_mean", "first")
+        control_f1=("control_f1_mean", "first"),
+        ctrl_valid=("control_n_runs_valid", "first"),
     ).reset_index().sort_values("fraction", ascending=False)
+
+    # Only draw the control curve where every seed produced a usable score;
+    # otherwise NaN creates a gap instead of a misleading point at 0.
+    future_summary["control_f1_plot"] = np.where(
+        future_summary["ctrl_valid"] == len(args.seeds),
+        future_summary["control_f1"], np.nan)
 
     axes[0].plot(future_summary["fraction"] * 100, future_summary["future_f1"],
                  "-o", color="crimson", linewidth=2, label="Drifted Future Stream (Chunks 2-10)")
-    axes[0].plot(future_summary["fraction"] * 100, future_summary["control_f1"],
+    axes[0].plot(future_summary["fraction"] * 100, future_summary["control_f1_plot"],
                  "--s", color="forestgreen", linewidth=2, label="No-Drift Control (Chunk 1 Holdout)")
+    starved = future_summary[future_summary["ctrl_valid"] < len(args.seeds)]
+    if not starved.empty:
+        axes[0].axvspan(starved["fraction"].min() * 100 * 0.5,
+                        starved["fraction"].max() * 100 * 2,
+                        color="grey", alpha=0.18,
+                        label="Too few positives to compare")
+        axes[0].annotate("control starved\nof positives",
+                         xy=(starved["fraction"].max() * 100,
+                             axes[0].get_ylim()[1] * 0.92),
+                         ha="center", fontsize=8, color="dimgrey")
     axes[0].set_xscale("log")
     axes[0].set_xlabel("Label Availability (%) — Log Scale")
     axes[0].set_ylabel("F1 Score")

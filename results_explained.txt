@@ -29,62 +29,80 @@ on chunks 2-10 (future). We also did each run 3 times with different
 random seeds to make sure the result isn't luck.
 
 RESULT (F1, average across 3 seeds):
-  Chunk 1 (training era, held-out):  0.199   <- model is good here
+  Chunk 1 (training era, held-out):  0.178   <- model is good here
   Chunk 2  (near future):            0.083
-  Chunk 3:                           0.075
-  Chunk 4:                           0.100
-  Chunk 5:                           0.096
-  Chunk 6:                           0.072
-  Chunk 7:                           0.065
-  Chunk 8:                           0.064
-  Chunk 9:                           0.072
-  Chunk 10 (far future):             0.105
+  Chunk 3:                           0.077
+  Chunk 4:                           0.104
+  Chunk 5:                           0.101
+  Chunk 6:                           0.074
+  Chunk 7:                           0.064
+  Chunk 8:                           0.053
+  Chunk 9:                           0.076
+  Chunk 10 (far future):             0.107
 
 WHAT THIS MEANS IN PLAIN WORDS:
-- The model is DECENT on its own time period (F1 ~0.20).
-- The instant the future arrives, performance CRASHES to about 0.06-0.10
-  and stays low. That is a ~59% relative drop.
+- The model is DECENT on its own time period (F1 ~0.18).
+- The instant the future arrives, performance CRASHES to about 0.05-0.11
+  and stays low. That is a 40-70% relative drop (~54% measured against
+  the average of the future chunks).
 - ROC-AUC (a separate, more technical score that ignores the threshold)
-  also drops from ~0.89 to ~0.68, proving the model really got worse at
-  RANKING — it's not just a bad cutoff, it's genuine decay.
+  also drops from ~0.89 to 0.69-0.73, proving the model really got worse
+  at RANKING — it's not just a bad cutoff, it's genuine decay.
 - WHY this happens: SAML-D introduces NEW fraud patterns over time that
   the training era never saw. So "what laundering looks like" changes.
 
 ONE-LINE SUMMARY:
-  A model trained on the past loses ~60% of its quality as the future
+  A model trained on the past loses 40-70% of its quality as the future
   arrives. Concept drift is real and severe here.
 
 =====================================================================
 PHASE D — CAN WE NOTICE THE DAMAGE?    (Answer: partially, without labels)
 =====================================================================
-We ran 4 "smoke detectors" to see if the model's decline could be spotted:
+We ran 5 label-free "smoke detectors" to see if the model's decline could be
+spotted, all of them without a single fraud label:
 
-  Detector 1: PSI on input features (compares the data's own statistics)
-     Result: saw NOTHING (PSI always ~0.02, far below the 0.20 alarm).
-     Meaning: the raw transaction data looks almost identical over time
-     — the "inputs" don't drift, only the fraud PATTERNS do.
+  Detector 1: PSI on 6 derived numeric input features
+             (amount, log-amount, hour of day, day of week,
+              transactions-per-sender, average-amount-per-sender)
+     Result: saw NOTHING (0 of 9 chunks; worst PSI anywhere = 0.036,
+     far below the 0.20 alarm).
+     Meaning: the transaction data's own distributions look almost
+     identical over time — the "inputs" barely move.
 
-  Detector 2: KS on the model's predicted probabilities (label-free)
-     Result: fired an alarm on 6 of 9 future chunks.
-     Meaning: the model's own confidence scores shift slightly — a weak
-     but real label-free warning.
+  Detector 2: PSI on categorical inputs (currencies, bank locations,
+             payment type)
+     Result: saw NOTHING (0 of 9; worst PSI = 0.0038).
+     Meaning: category mix is unchanged. This is why detector 1 is not
+     just an oversight — adding behavioural features genuinely didn't help.
 
-  Detector 3: Domain classifier (XGBoost that tries to tell "old" from
-     "new" data, 3 seeds)
-     Result: fired on ALL 9 future chunks, AUC ~0.59-0.61 (mean ± small
-     error). Meaning: when you give the classifier derived behaviour
-     features (time-of-day, spending per account), it CAN tell the
-     future data apart — a stable, label-free signal.
+  Detector 3: KS test on the model's predicted probabilities
+     Result: fired on 7 of 9 future chunks.
+     Meaning: the model's own confidence scores shift slightly — a label-
+     free warning, but see the honesty note below.
 
-  Detector 4: Performance detector (F1 on labeled data)
-     Result: saw the drop everywhere (this is just Phase C's decay
-     measured with labels).
+  Detector 4: PSI on the same predicted probabilities
+     Result: saw NOTHING (0 of 9; worst PSI = 0.00019).
+     Meaning: how MUCH the scores moved is practically nil.
+
+  Detector 5: Domain classifier (XGBoost that tries to tell "old" rows
+             from "new" rows, 3 seeds)
+     Result: fired on ALL 9 future chunks, AUC 0.58-0.61 (mean ± 95% CI).
+     Meaning: given derived behaviour features, a classifier CAN tell the
+     future data apart — the strongest and most stable label-free signal.
+
+HONESTY NOTE (important, and worth saying in a paper):
+  Detectors 3 and 4 disagree, and the reason is sample size. With ~1,000,000
+  rows per chunk, the KS critical value falls to about 0.002, so KS rejects on
+  differences that are statistically detectable but practically meaningless.
+  KS is a SENSITIVITY test; PSI is an EFFECT-SIZE test. Reporting only KS
+  would overstate the drift; reporting only PSI would understate it. We
+  report both, and the truth is "the output distribution moves, but not
+  by much."
 
 WHAT THIS MEANS IN PLAIN WORDS:
 - The drift is HARD to see from the raw data alone (inputs barely move),
   but it IS recoverable without labels if you look in the right place:
-  the model's own output distribution shifts, and a behaviour-feature
-  domain classifier flags all future chunks.
+  a behaviour-feature domain classifier flags every future chunk.
 - The most direct, strongest signal is still the labeled F1 drop.
 
 =====================================================================
@@ -99,25 +117,37 @@ MATCHED "no-drift control" — the same label budget, but evaluated on
 chunk 1 where there is NO drift.
 
 RESULT (future chunks, F1):
-  Labels available | F1 on drifted future  | No-drift control F1
-  100%             | 0.089                 | 0.232
-  50%              | 0.088                 | 0.223
-  10%              | 0.093                 | 0.180
-  5%               | 0.099                 | 0.197
-  1%               | 0.127 (noisy)         | 0.129
-  0.1%             | too few positives     | too few positives
+  Labels available | F1 on drifted future  | No-drift control F1 | Future/Control
+  100%             | 0.092                 | 0.170                |  0.54
+  50%              | 0.094                 | 0.184                |  0.51
+  10%              | 0.088                 | 0.166                |  0.53
+  5%               | 0.075                 | 0.131                |  0.57
+  1%               | 0.114 (3/3 seeds)     | only 1/3 seeds scored|  not comparable
+  0.1%             | too few positives     | too few positives    |  not measurable
+
+A ratio is only printed when ALL THREE control seeds produced a real score.
+Below that threshold the comparison is meaningless, so we leave it blank
+instead of dividing by a number that was never measured.
 
 WHAT THIS MEANS IN PLAIN WORDS:
-- At every realistic label budget, the drifted future data scores about
-  HALF as well (0.09) as the no-drift control (0.18-0.23).
-- So the decay is GENUINE DRIFT, not a measurement artifact.
-- Label scarcity itself costs very little (F1 barely changes from 100% to
-  10% labels). Running out of labels mostly stops you from REPAIRING.
-- Below 1% labels there are only ~4-10 fraud examples visible, so we
+- At every budget we can actually measure (100% down to 5%), the drifted
+  future data scores only 51-57% as well as the no-drift control. So the
+  decay is GENUINE DRIFT, not a measurement artifact.
+- Label scarcity itself costs very little: the drifted arm's F1 is
+  essentially flat from 100% down to 5% labels (0.092 -> 0.075, within
+  overlapping 95% confidence intervals). Running out of labels mostly
+  stops you from REPAIRING, not from DETECTING.
+- Below 5% we stop answering the question rather than guessing. At 1%,
+  only ~10 fraud examples are visible per chunk and 2 of the 3 control
+  runs found too few positives to score at all; at 0.1% (about 1 positive
+  per chunk) neither arm can be scored. The honest statement is "the
+  measurement breaks down here", not "drift disappeared".
+- Below 0.1% labels there are too few positives to score at all, so we
   honestly report "not enough data" (NaN) instead of a fake 0.
 
 ONE-LINE SUMMARY:
-  The drop is real drift — not caused by having few labels.
+  The drop is real drift — at every reliable label budget the future scores
+  barely half of a no-drift control, and it is not caused by having few labels.
 
 =====================================================================
 PHASE F — DOES RETRAINING FIX IT?   (Answer: Partially, if done right)
@@ -126,7 +156,7 @@ Every strategy was tested OUT-OF-SAMPLE: a model trained on chunks
 1..c-1 is scored on the NEXT unseen chunk c (never its own data).
 
   Strategy                       | Mean F1 (chunks 2-10) | Final chunk
-  no_retrain (frozen baseline)   |   0.089               |   0.112
+  no_retrain (frozen baseline)   |   0.092               |   0.118
   periodic_full (retrain on ALL  |   0.114  (+28%)       |   0.155
       history, natural weights)  |
   periodic_sliding (last 2       |   0.106               |   0.135
@@ -134,18 +164,34 @@ Every strategy was tested OUT-OF-SAMPLE: a model trained on chunks
   periodic_weighted (naive       |   0.030   (WORSE!)    |   0.023
       10x up-weight)             |
 
-We also swept the positive-class weight w in {1,10,50,100}. Result:
-w=1 (natural ratio) won on EVERY chunk; heavier weighting DESTROYED
-precision (F1 collapsed to ~0.03 even though recall rose to 0.23). So
-"just boost the fraud class" is actively harmful.
+We also swept the positive-class weight w in {1,10,50,100} (on top of the
+dataset's natural imbalance ratio). Averages over chunks 2-10:
+
+  w    | Mean F1  | Precision | Recall  | Beats other w on
+  1    | 0.1004   | 0.5470    | 0.0579  | 9 / 9 chunks
+  10   | 0.0212   | 0.0112    | 0.2116  | 0 / 9
+  50   | 0.0076   | 0.0038    | 0.4134  | 0 / 9
+  100  | 0.0032   | 0.0016    | 0.5588  | 0 / 9
+
+  ("Beats other w on" compares the four multipliers against each other.
+   Even w=1 trails the frozen baseline on chunks 2, 3 and 7 — beating a
+   re-weighting scheme is not the same as beating no retraining at all.)
 
 WHAT THIS MEANS IN PLAIN WORDS:
 - Periodic full-history retraining is the ONLY reliable repair: about
-  +28% relative F1 (0.089 -> 0.114; final chunk 0.112 -> 0.155).
+  +28% relative F1 (0.092 -> 0.114; final chunk 0.118 -> 0.155).
 - Forgetting old data (sliding window) helps a bit but not as much as
   keeping all history when drift is mild.
 - Correct class weighting matters: over-weighting is a precision-killer.
-- Even the best strategy does NOT fully restore training-era F1 (0.199).
+  Pushing w up keeps buying recall (0.058 -> 0.559) and pays for it in
+  precision (0.547 -> 0.0016), so F1 falls monotonically. Boosting a class
+  that is 1-in-1,000 doesn't make the model better at RANKING fraud, it
+  just drags the decision threshold until almost every alert is wrong.
+  "Just boost the fraud class" is actively harmful here.
+- Fair to the weighted runs: their PR-AUC is still slightly BETTER than the
+  frozen baseline. The damage is confined to the thresholded decision, not
+  to the quality of the underlying scores.
+- Even the best strategy does NOT fully restore training-era F1 (0.178).
   Retraining recovers a meaningful chunk of the loss cheaply, but labels
   alone can't fully undo a change in WHAT laundering looks like.
 
@@ -156,14 +202,16 @@ ONE-LINE SUMMARY:
 =====================================================================
 THE WHOLE STORY IN 4 BULLETS (memorise these)
 =====================================================================
-1) C — The model genuinely decays: F1 dropped ~59% (0.20 -> ~0.08) as
-      the future arrived. Real drift.
-2) D — The drift is hard to see in raw data, but a behaviour-feature
-      domain classifier flags ALL future chunks (and model output KS 6/9)
-      even without labels. Best signal is still the labeled F1 drop.
+1) C — The model genuinely decays: F1 fell 40-70% (0.18 -> 0.05-0.11) as
+      the future arrived. Real drift, and real loss of ranking power.
+2) D — The drift is hard to see in raw data (all input PSI: 0/9), but a
+      behaviour-feature domain classifier flags ALL 9 future chunks without
+      a single label. Best signal is still the labeled F1 drop.
 3) E — The decay is real drift, NOT a label illusion: a matched no-drift
-      control scores ~2x higher than the drifted future at every budget.
-      Label scarcity itself costs <5%.
+      control scores ~1.8-2.0x higher than the drifted future at every budget
+      where the measurement is trustworthy (100% down to 5%). Label scarcity
+      itself costs almost nothing; below 5% the measurement stops being
+      possible, and we report that instead of a number.
 4) F — Repair works only if done right: periodic full-history retraining
       recovers +28% relative F1 out-of-sample; over-weighting the fraud
       class actively makes it worse.
@@ -172,5 +220,10 @@ BOTTOM LINE: AML concept drift is severe, only partly visible without
 labels, and bounded by label availability — but a correctly-weighted,
 periodic full retrain is a cheap and worthwhile repair.
 =====================================================================
-   (Written 2026-09-04, numbers match results_phaseC/D/E/F/*.csv)
+   (Revised 2026-09-30; every number re-checked against
+    results_phaseC/D/E/F/*.csv after the full B-F re-run. The Phase C decay
+    range, the Phase D KS count, the Phase F strategy row and the Phase E
+    table were all updated; Phase E's "control starved but rendered as
+    0.0000" aggregation bug was fixed, which replaced the old spurious
+    1% convergence (ratio 0.98) with an explicit "not comparable".)
 =====================================================================
