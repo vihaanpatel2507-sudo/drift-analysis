@@ -58,12 +58,51 @@ DROP_COLS = LEAKAGE_COLS + ID_COLS + RAW_TIME_COLS + [TIMESTAMP_COL, LABEL_COL]
 # Seeds for the multi-seed experiments ([C2] baseline seeds, [D3] domain clf).
 BASELINE_SEEDS = [42, 7, 123]
 DETECTOR_SEEDS = [42, 7, 123]
-
-# Decision-threshold tuning grid shared by phase C and phase F.
 THRESHOLD_LO, THRESHOLD_HI, THRESHOLD_STEP = 0.01, 0.99, 0.01
 
+# -----------------------------------------------------------------------#
+# Confidence intervals: t-interval for small n, bootstrap for large n
+# -----------------------------------------------------------------------#
 
-# -----------------------------------------------------------------------
+
+def t_interval_95(std, n):
+    """Half-width of a 95% confidence interval using t-distribution.
+
+    For n=3, uses t(0.975, 2) ≈ 4.30 instead of the too-narrow 1.96σ/√n.
+    """
+    if n is None or n <= 0 or std is None:
+        return float("nan")
+    if isinstance(std, float) and np.isnan(std):
+        return float("nan")
+    if n == 1:
+        return float("nan")
+    t_crit = stats.t.ppf(0.975, df=max(n - 1, 1))
+    return t_crit * float(std) / np.sqrt(max(n, 1))
+
+
+
+
+def bootstrap_ci(data, n_boot=1000, alpha=0.95, seed=None):
+    import numpy as np
+    rng = np.random.default_rng(seed)
+    data = np.asarray(data, dtype=float)
+    if len(data) == 0:
+        return (float("nan"), float("nan"))
+    if len(data) < 3:
+        d_mean = np.mean(data)
+        d_std = np.std(data, ddof=1)
+        half = t_interval_95(d_std, len(data))
+        if np.isnan(half):
+            return (d_mean, d_mean)
+        return (d_mean - half, d_mean + half)
+    stats_arr = []
+    for _ in range(n_boot):
+        sample = rng.choice(data, size=len(data), replace=True)
+        stats_arr.append(np.mean(sample))
+    lower = np.percentile(stats_arr, (1 - alpha) / 2 * 100)
+    upper = np.percentile(stats_arr, (1 + alpha) / 2 * 100)
+    return (float(lower), float(upper))
+
 # Label encoder
 # -----------------------------------------------------------------------
 
@@ -470,6 +509,152 @@ def add_seed_manifest(df, seeds):
     out = df.copy()
     out["seeds"] = ";".join(str(s) for s in seeds)
     return out
+
+
+def compute_tx_per_sender_expanding(df, timestamp_col="__timestamp__", account_col="Sender_account"):
+    """Compute tx_per_sender using expanding window up to each transaction."""
+    df = df.copy()
+    df[timestamp_col] = pd.to_datetime(df[timestamp_col], errors="coerce")
+    df = df.sort_values(timestamp_col)
+    counts = df.groupby(account_col).cumcount() + 1
+    return counts.astype(float)
+
+
+def compute_amount_per_sender_mean_expanding(df, timestamp_col="__timestamp__", account_col="Sender_account"):
+    """Compute amount_per_sender_mean using expanding window up to each transaction."""
+    df = df.copy()
+    df[timestamp_col] = pd.to_datetime(df[timestamp_col], errors="coerce")
+    df = df.sort_values(timestamp_col)
+    sender_amounts = df.groupby(account_col)["Amount"].transform(lambda x: x.expanding().mean())
+    return sender_amounts.astype(float)
+
+
+def calibrate_domain_classifier(chunk_1_path, seeds=None):
+    """Calibrate domain classifier on Chunk 1 holdout (no-drift scenario)."""
+    if seeds is None:
+        seeds = [42, 7, 123]
+    from xgboost import XGBClassifier
+    from sklearn.model_selection import train_test_split
+    from sklearn.metrics import roc_auc_score
+    X1, y1, _ = load_chunk(chunk_1_path, fit_encoders=True)
+    auc_scores = []
+    for seed in seeds:
+        X_train, X_val, y_train, y_val = train_test_split(X1, y1, test_size=0.2, random_state=seed, stratify=y1)
+        model = XGBClassifier(n_estimators=300, max_depth=6, learning_rate=0.05,
+                              scale_pos_weight=(y_train == 0).sum() / max((y_train == 1).sum(), 1),
+                              random_state=seed, n_jobs=-1, tree_method="hist")
+        model.fit(X_train, y_train)
+        val_proba = model.predict_proba(X_val)[:, 1]
+        auc_scores.append(roc_auc_score(y_val, val_proba))
+    auc_mean = float(np.mean(auc_scores))
+    auc_std = float(np.std(auc_scores, ddof=1))
+    auc_ci95 = t_interval_95(auc_std, len(auc_scores))
+    null_auc = []
+    for _ in range(1000):
+        X_null, y_null = train_test_split(X1, y1, test_size=0.2, random_state=None, stratify=y1)
+        model_null = XGBClassifier(n_estimators=300, max_depth=6, learning_rate=0.05,
+                                    random_state=None, n_jobs=-1, tree_method="hist")
+        model_null.fit(X_null, y_null)
+        proba_null = model_null.predict_proba(X_null)[:, 1]
+        null_auc.append(roc_auc_score(y_null, proba_null))
+    null_auc = np.array(null_auc)
+    optimal_threshold = float(np.percentile(null_auc, 95))
+    return {
+        "auc_mean": auc_mean,
+        "auc_std": auc_std,
+        "auc_ci95": auc_ci95,
+        "auc_scores": auc_scores,
+        "optimal_threshold": optimal_threshold,
+        "false_positive_rate_0.55": float(np.mean(np.array(auc_scores) > 0.55)),
+        "false_positive_rate_optimal": float(np.mean(np.array(auc_scores) > optimal_threshold)),
+        "null_mean": float(np.mean(null_auc)),
+        "null_std": float(np.std(null_auc, ddof=1)),
+    }
+
+
+def compute_positive_rate_per_chunk(chunk_files):
+    """Compute positive rate (prior probability) per chunk."""
+    rates = []
+    for cnum, cf in chunk_files:
+        df = pd.read_csv(cf)
+        pos_rate = df["Is_laundering"].mean()
+        rates.append({"chunk": cnum, "positive_rate": pos_rate})
+    return pd.DataFrame(rates)
+
+
+def domain_classifier_X_only(X, y, seed=42):
+    """Train domain classifier using only X (covariate shift test)."""
+    from xgboost import XGBClassifier
+    from sklearn.model_selection import train_test_split
+    from sklearn.metrics import roc_auc_score
+    X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=seed, stratify=y)
+    model = XGBClassifier(n_estimators=300, max_depth=6, learning_rate=0.05,
+                           random_state=seed, n_jobs=-1, tree_method="hist")
+    model.fit(X_train, y_train)
+    val_proba = model.predict_proba(X_val)[:, 1]
+    return roc_auc_score(y_val, val_proba)
+
+
+def check_pYgX_shift(chunk_files, seeds=None):
+    """Check if performance gaps persist after importance-weighting."""
+    if seeds is None:
+        seeds = [42, 7, 123]
+    from xgboost import XGBClassifier
+    from sklearn.metrics import roc_auc_score, f1_score
+    results = []
+    for seed in seeds:
+        first_cnum, first_cf = chunk_files[0]
+        X1, y1, encoders = load_chunk(first_cf, fit_encoders=True)
+        for cnum, cf in chunk_files[1:]:
+            X, y, _ = load_chunk(cf, encoders=encoders, fit_encoders=False)
+            model_unw = XGBClassifier(n_estimators=300, max_depth=6, learning_rate=0.05,
+                                       random_state=seed, n_jobs=-1, tree_method="hist")
+            model_unw.fit(X1, y1)
+            proba_unw = model_unw.predict_proba(X)[:, 1]
+            neg = float((y1 == 0).sum())
+            pos = float((y1 == 1).sum())
+            spw = neg / max(pos, 1)
+            model_w = XGBClassifier(n_estimators=300, max_depth=6, learning_rate=0.05,
+                                     scale_pos_weight=spw, random_state=seed,
+                                     n_jobs=-1, tree_method="hist")
+            model_w.fit(X1, y1)
+            proba_w = model_w.predict_proba(X)[:, 1]
+            results.append({
+                "seed": seed, "chunk": cnum,
+                "auc_unweighted": roc_auc_score(y, proba_unw),
+                "auc_weighted": roc_auc_score(y, proba_w),
+                "f1_unweighted": f1_score(y, (proba_unw > 0.5).astype(int)),
+                "f1_weighted": f1_score(y, (proba_w > 0.5).astype(int)),
+            })
+    return pd.DataFrame(results)
+
+
+def f1_by_laundering_type(chunk_files):
+    """Break down positives by Laundering_type for analysis only."""
+    stats = []
+    for cnum, cf in chunk_files:
+        df = pd.read_csv(cf)
+        if "Laundering_type" in df.columns:
+            for lt in sorted(df["Laundering_type"].unique()):
+                mask = df["Laundering_type"] == lt
+                n_pos = mask.sum()
+                if n_pos > 0:
+                    stats.append({"chunk": cnum, "laundering_type": lt, "n_positives": n_pos})
+    if stats:
+        return pd.DataFrame(stats)
+    return pd.DataFrame()
+
+
+def get_domain_classifier_feature_importances(X_train, y_train, seed=42):
+    """Get XGBoost feature importances from domain classifier."""
+    from xgboost import XGBClassifier
+    model = XGBClassifier(n_estimators=300, max_depth=6, learning_rate=0.05,
+                           random_state=seed, n_jobs=-1, tree_method="hist")
+    model.fit(X_train, y_train)
+    feature_names = [f"f{i}" for i in range(X_train.shape[1])]
+    importances = list(zip(feature_names, model.feature_importances_))
+    importances.sort(key=lambda x: x[1], reverse=True)
+    return importances
 
 
 def ci95(std, n):

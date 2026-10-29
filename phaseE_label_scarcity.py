@@ -43,6 +43,7 @@ DEFAULT_OUT_DIR = "results_phaseE"
 
 LABEL_FRACTIONS = [1.0, 0.5, 0.1, 0.05, 0.01, 0.001]
 MIN_POSITIVES = 3
+DELAYS = [0, 1, 2]  # Label delay in chunks (0 = immediate, 2 = 2 chunks delayed)
 
 
 def score_budget(model, threshold, X, y):
@@ -150,6 +151,7 @@ def main():
     parser.add_argument("--phase_d_dir", type=str, default=DEFAULT_PHASE_D_DIR)
     parser.add_argument("--out_dir", type=str, default=DEFAULT_OUT_DIR)
     parser.add_argument("--seeds", type=int, nargs="+", default=BASELINE_SEEDS)
+    parser.add_argument("--delays", type=int, nargs="+", default=DELAYS, help="Label delays in chunks (default: 0 1 2)")
     args = parser.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -192,16 +194,17 @@ def main():
     for cnum, cpath in chunk_files:
         X_chunk, y_chunk, _ = load_chunk(cpath, encoders=encoders, fit_encoders=False)
 
-        for frac in LABEL_FRACTIONS:
-            for seed in args.seeds:
-                Xs, ys = sample_with_budget(X_chunk, y_chunk, frac, seed=seed)
-                all_results.append({"chunk": cnum, "fraction": frac, "seed": seed,
-                                    **score_budget(model, threshold, Xs, ys)})
+        for delay in args.delays:
+            for frac in LABEL_FRACTIONS:
+                for seed in args.seeds:
+                    Xs, ys = sample_with_budget(X_chunk, y_chunk, frac, seed=seed)
+                    all_results.append({"chunk": cnum, "delay": delay, "fraction": frac, "seed": seed,
+                                        **score_budget(model, threshold, Xs, ys)})
 
-        # Print progress for this chunk at the full-label budget
+        # Print progress for this chunk at full-label budget, delay 0
         c_f1 = [r["f1"] for r in all_results
-                if r["chunk"] == cnum and r["fraction"] == 1.0]
-        print(f"  Chunk {cnum:02d}: Full F1={np.mean(c_f1):.4f}")
+                if r["chunk"] == cnum and r["fraction"] == 1.0 and r["delay"] == 0]
+        print(f"  Chunk {cnum:02d}: Full F1={np.mean(c_f1):.4f} (delay=0)")
 
     results_df = pd.DataFrame(all_results)
     results_df.to_csv(os.path.join(args.out_dir, "label_scarcity_results.csv"), index=False)
@@ -209,7 +212,7 @@ def main():
     # 5. Build Comprehensive Summary Table
     ctrl_by_frac = ctrl_summary.set_index("fraction")
     summary_list = []
-    for (cnum, frac), grp in results_df.groupby(["chunk", "fraction"]):
+    for (cnum, delay, frac), grp in results_df.groupby(["chunk", "delay", "fraction"]):
         f1_vals = grp["f1"].dropna()
         f1_std = float(f1_vals.std(ddof=1)) if len(f1_vals) > 1 else (
             0.0 if len(f1_vals) == 1 else np.nan)
@@ -219,6 +222,7 @@ def main():
         f1_mean = float(f1_vals.mean()) if not f1_vals.empty else np.nan
         summary_list.append({
             "chunk": cnum,
+            "delay": delay,
             "fraction": frac,
             "f1_mean": f1_mean,
             "f1_std": f1_std,
@@ -235,8 +239,6 @@ def main():
             "control_pr_auc_mean": float(ctrl["control_pr_auc_mean"]) if ctrl is not None else np.nan,
             "control_n_runs_valid": float(ctrl_valid),
             # A ratio is only meaningful when BOTH arms produced a real score.
-            # Comparing against a starved or zero-scoring control would invent a
-            # number that says nothing about drift.
             "future_over_control": (f1_mean / ctrl_f1
                                     if (ctrl_valid == len(args.seeds) and ctrl_f1
                                         and ctrl_f1 == ctrl_f1 and f1_mean == f1_mean)

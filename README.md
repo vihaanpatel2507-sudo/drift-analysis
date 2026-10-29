@@ -33,7 +33,50 @@ This project investigates the full lifecycle of AML model decay and management:
 
 ---
 
-## 3. Phase-by-Phase Experimental Results
+## 2. Key Methodological Changes & Improvements
+
+This section documents all technical changes made to the original experimental pipeline:
+
+### 2.1 Confidence Intervals (t-intervals instead of normal approximation)
+With only **n=3 random seeds**, the standard `1.96σ/√n` formula produces unrealistically narrow confidence intervals. All phases now use the **t-distribution** (`t(0.975, 2) ≈ 4.30`) via `common.t_interval_95()` instead. Bootstrap CIs (`common.bootstrap_ci()`) are also available for resampling-based interval estimation over transactions/entities.
+
+### 2.2 Time-Ordered Threshold Tuning (Phase C)
+The decision threshold is now tuned on the **last 20% of Chunk 1 chronologically** instead of a random stratified 20% split. This eliminates temporal information leakage and produces more realistic thresholds for deployment.
+
+### 2.3 Rolling/Expanding Window Features
+`tx_per_sender` and `amount_per_sender_mean` are now computed using **expanding windows** (all history up to each transaction) instead of per-chunk totals. This prevents chunk-size artifacts where larger chunks become trivially separable.
+
+### 2.4 Drift Type Separation (Phase D)
+Three drift types are now explicitly separated:
+* **Prior shift:** Positive rate per chunk measured via `common.compute_positive_rate_per_chunk()`
+* **Covariate shift:** Domain classifier trained on X only via `common.domain_classifier_X_only()`
+* **Conditional shift (P(Y|X)):** Classifier performance gaps checked after importance-weighting via `common.check_pYgX_shift()`
+
+### 2.5 Domain Classifier Calibration
+Instead of a fixed `AUC = 0.55` alarm threshold, the domain classifier is calibrated on Chunk 1 holdout (no-drift) using a **null distribution** (95th percentile of AUC on random splits). Reports AUC mean, CI, false-positive rate at both 0.55 and optimal threshold.
+
+### 2.6 Stronger Multivariate Detectors (Phase D)
+* **MMD (Maximum Mean Discrepancy)** with permutation null test
+* **LOF (Local Outlier Factor)** detector trained on reference, applied to current stream
+* **ADWIN** drift detector on error stream
+* **DDM (Drift Detection Method)** on error stream
+* **KS effect-size reporting:** KS statistic + subsampled KS (N=10,000) alongside p-value
+* **Synthetic drift injection** and **detection delay measurement**
+
+### 2.7 Label Scarcity with Delays (Phase E)
+Labels are now available at **100%, 10%, and 5%** budgets with **delays of 0, 1, and 2 chunks** — directly addressing RQ4 with delayed label feedback.
+
+### 2.8 Trigger-Based Retraining Policy (Phase F)
+Instead of fixed every-2-chunks retraining, retraining fires **only when the domain-classifier alarm triggers**. Compares retrain count vs F1 against fixed-schedule baselines.
+
+### 2.9 Expanded Class-Weight Sweep (Phase F)
+`scale_pos_weight` sweep now ranges from **0.01× to 1× of the natural ratio** (0.01, 0.1, 0.5) as well as above it (1, 10, 50, 100). Includes a **no-weighting run** (w=1, natural ratio) for comparison.
+
+### 2.10 Feature Importances / SHAP for Domain Classifier
+`common.get_domain_classifier_feature_importances()` reports which behavioral features carry the drift signal from the domain classifier.
+
+### 2.11 Laundering_type Breakdown (Analysis Only)
+`common.f1_by_laundering_type()` breaks down F1 by laundering typology for analysis — **never used as a model feature**.
 
 ### Phase B — Preprocessing & Temporal Chunking
 * **Script:** `phaseB_chunking.py` $\rightarrow$ Outputs: `chunks/chunk_01.csv` ... `chunk_10.csv`

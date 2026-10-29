@@ -150,6 +150,159 @@ def run_domain_classifier(ref_x, cur_x, seed):
     return roc_auc_manual(y_te, clf.predict_proba(X_te)[:, 1])
 
 
+def ks_with_effect_size(reference, current, n_subsample=10000, alpha=KS_ALPHA):
+    """KS statistic with effect-size reporting via subsampling."""
+    from scipy.stats import ks_2samp
+    stat = float(ks_2samp(reference, current).statistic)
+    crit = ks_critical_value(len(reference), len(current), alpha)
+    if len(reference) > n_subsample or len(current) > n_subsample:
+        ref_sub = np.random.choice(reference, size=min(n_subsample, len(reference)), replace=False)
+        cur_sub = np.random.choice(current, size=min(n_subsample, len(current)), replace=False)
+        subs_stat = float(ks_2samp(ref_sub, cur_sub).statistic)
+        subs_p = float(ks_2samp(ref_sub, cur_sub).pvalue)
+    else:
+        subs_stat = stat
+        subs_p = float(ks_2samp(reference, current).pvalue)
+    return stat, crit, subs_stat, subs_p
+
+
+def mmd_two_sample_test(reference, current, gamma=1.0, n_permutations=200, seed=42):
+    """Maximum Mean Discrepancy two-sample test with permutation null."""
+    rng = np.random.default_rng(seed)
+
+    def rbf_kernel(X, Y, gamma):
+        XX = np.sum(X**2, axis=1, keepdims=True)
+        YY = np.sum(Y**2, axis=1, keepdims=True)
+        XY = X @ Y.T
+        d2 = XX + YY.T - 2 * XY
+        return np.exp(-gamma * d2)
+
+    n_ref = min(2000, len(reference))
+    n_cur = min(2000, len(current))
+    ref_idx = rng.choice(len(reference), size=n_ref, replace=False)
+    cur_idx = rng.choice(len(current), size=n_cur, replace=False)
+    X = reference[ref_idx]
+    Y = current[cur_idx]
+
+    K_XX = rbf_kernel(X, X, gamma)
+    K_YY = rbf_kernel(Y, Y, gamma)
+    K_XY = rbf_kernel(X, Y, gamma)
+
+    mmd_stat = np.mean(K_XX) + np.mean(K_YY) - 2 * np.mean(K_XY)
+
+    combined = np.concatenate([X, Y])
+    perm_stats = []
+    n_x = len(X)
+    for _ in range(n_permutations):
+        perm = rng.permutation(len(combined))
+        X_p = combined[perm[:n_x]]
+        Y_p = combined[perm[n_x:]]
+        K_XX_p = rbf_kernel(X_p, X_p, gamma)
+        K_YY_p = rbf_kernel(Y_p, Y_p, gamma)
+        K_XY_p = rbf_kernel(X_p, Y_p, gamma)
+        perm_stats.append(np.mean(K_XX_p) + np.mean(K_YY_p) - 2 * np.mean(K_XY_p))
+
+    pvalue = float(np.mean(np.array(perm_stats) >= mmd_stat))
+    return float(mmd_stat), pvalue
+
+
+def lof_detector(reference, current, contamination=0.001):
+    """Local Outlier Factor detector trained on reference, applied to current."""
+    from sklearn.neighbors import LocalOutlierFactor
+    lof = LocalOutlierFactor(n_neighbors=20, contamination=contamination, novelty=True)
+    lof.fit(reference)
+    scores = lof.decision_function(current)
+    predictions = lof.predict(current)
+    outlier_fraction = float(np.mean(predictions == -1))
+    return float(np.mean(scores)), outlier_fraction, scores
+
+
+def run_adwin(errors, delta=0.002):
+    """ADWIN drift detector on error stream."""
+    from collections import deque
+    window = deque()
+    total = 0.0
+    width = 0
+    drift_point = None
+    for i, error in enumerate(errors):
+        window.append(error)
+        total += error
+        width += 1
+        if width < 2:
+            continue
+        n1 = width // 2
+        if n1 == 0:
+            continue
+        win1 = list(window)[:n1]
+        win2 = list(window)[n1:]
+        m1 = sum(win1) / len(win1)
+        m2 = sum(win2) / len(win2)
+        m = max(len(win1), len(win2))
+        bound = np.sqrt(np.log(2.0 / delta) / (2 * m))
+        if abs(m1 - m2) > bound:
+            drift_point = i
+            for _ in range(n1):
+                total -= window.popleft()
+                width -= 1
+            break
+    return drift_point is not None, drift_point
+
+
+def run_ddm(errors, warning_level=2.0, drift_level=3.0):
+    """Drift Detection Method (DDM) on error stream."""
+    p = 0.0
+    p_max = 0.0
+    s_max = 0.0
+    n = 0
+    drift = False
+    warning = False
+    for error in errors:
+        n += 1
+        p = p + (error - p) / n
+        s = np.sqrt(p * (1 - p) / n)
+        if p + s > p_max + s_max:
+            p_max = p + s
+            s_max = s
+        if p + s > p_max + drift_level * s_max:
+            drift = True
+            p = 0.0
+            p_max = 0.0
+            s_max = 0.0
+            n = 0
+        elif p + s > p_max + warning_level * s_max:
+            warning = True
+    return drift, warning
+
+
+def inject_synthetic_drift(raw_chunks, drift_magnitude=0.1, drift_type="amount_shift", seed=42):
+    """Inject synthetic drift into chunks for detection delay measurement."""
+    rng = np.random.default_rng(seed)
+    drifted = []
+    for cnum, df in raw_chunks:
+        df_drifted = df.copy()
+        if drift_type == "amount_shift" and "Amount" in df_drifted.columns:
+            df_drifted["Amount"] = df_drifted["Amount"] * (1 + drift_magnitude)
+        elif drift_type == "label_flip" and "Is_laundering" in df_drifted.columns:
+            n_flip = int(len(df_drifted) * drift_magnitude * 0.01)
+            flip_idx = rng.choice(len(df_drifted), size=n_flip, replace=False)
+            df_drifted.loc[flip_idx, "Is_laundering"] = 1 - df_drifted.loc[flip_idx, "Is_laundering"].values
+        drifted.append((cnum, df_drifted))
+    return drifted
+
+
+def measure_detection_delay(detector_results, drift_start_chunk):
+    """Measure detection delay for each detector."""
+    delays = {}
+    for method, detections in detector_results.items():
+        delay = None
+        for chunk, drifted in detections:
+            if drifted and chunk >= drift_start_chunk:
+                delay = chunk - drift_start_chunk
+                break
+        delays[method] = delay
+    return delays
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--chunks_dir", type=str, default=DEFAULT_CHUNKS_DIR)

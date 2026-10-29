@@ -30,6 +30,7 @@ from common import (
     tune_threshold,
     add_seed_manifest,
     ci95,
+    t_interval_95,  # Added: t-interval for small n
     list_chunk_files,
 )
 

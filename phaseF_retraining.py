@@ -58,8 +58,9 @@ DEFAULT_OUT_DIR = "results_phaseF"
 RETRAIN_EVERY = 2   # retrain cadence (in chunks) for the periodic strategies
 WINDOW = 2          # [F2] sliding window size (in chunks)
 WEIGHT_BOOST = 10   # boost multiplier for the periodic_weighted strategy
-SPW_SWEEP = [1, 10, 50, 100]   # [F1] positive-weight multipliers
+SPW_SWEEP = [0.01, 0.1, 0.5, 1.0, 10, 50, 100]   # [F1] positive-weight multipliers (below & above natural ratio)
 RETRAIN_SEED = 42
+DOMAIN_ALARM_THRESHOLD = 0.55  # domain classifier alarm threshold for trigger-based retraining
 
 
 def fit_xgb(X_train, y_train, seed=RETRAIN_SEED, weight_mult=1.0):
@@ -135,7 +136,7 @@ def main():
     # ==================================================================
     print("\n--- Experiment A: retraining strategies ---")
     strategies = ["no_retrain", "periodic_full", "periodic_sliding",
-                  "periodic_weighted"]
+                  "periodic_weighted", "trigger_based"]
     current = {s: (base_model, base_threshold) for s in strategies}
     rows_A = []
 
@@ -158,9 +159,53 @@ def main():
             print(f"  [chunk {c:02d}] retrained periodic_sliding on "
                   f"{len(X_win):,} rows ({fit_s:.1f}s)")
 
+            # trigger_based: retrain only when domain classifier alarm fires
+            # Calibrate domain classifier on Chunk 1 (no-drift reference)
+            if c == chunk_nums[1]:  # first evaluation chunk
+                from common import calibrate_domain_classifier
+                cal_result = calibrate_domain_classifier(
+                    os.path.join(args.chunks_dir, f"chunk_01.csv"))
+                domain_alarm_threshold = cal_result["optimal_threshold"]
+                print(f"  Domain classifier calibrated: optimal threshold={domain_alarm_threshold:.4f}, "
+                      f"FPR@0.55={cal_result['false_positive_rate_0.55']:.3f}, "
+                      f"FPR@optimal={cal_result['false_positive_rate_optimal']:.3f}")
+                current["trigger_alarm_threshold"] = domain_alarm_threshold
+                current["trigger_retrain_count"] = 0
+
+            # Run domain classifier: ref (chunk 1) vs cur (chunk c)
+            X_ref, y_ref = encoded[chunk_nums[0]]
+            X_cur, y_cur = encoded[c]
+            from xgboost import XGBClassifier
+            from sklearn.model_selection import train_test_split
+            from sklearn.metrics import roc_auc_score
+
+            X_dom = pd.concat([X_ref, X_cur], axis=0, ignore_index=True)
+            y_dom = pd.Series(np.concatenate([np.zeros(len(X_ref)), np.ones(len(X_cur))]))
+            X_tr, X_te, y_tr, y_te = train_test_split(
+                X_dom, y_dom, test_size=0.3, random_state=RETRAIN_SEED)
+            clf = XGBClassifier(n_estimators=150, max_depth=5, learning_rate=0.1,
+                                 random_state=RETRAIN_SEED, n_jobs=-1, tree_method='hist')
+            clf.fit(X_tr, y_tr)
+            cur_dom_auc = roc_auc_score(y_te, clf.predict_proba(X_te)[:, 1])
+
+            alarm_threshold = current.get("trigger_alarm_threshold", DOMAIN_ALARM_THRESHOLD)
+            alarm_fired = cur_dom_auc > alarm_threshold
+
+            # Retrain only if alarm fires
+            if alarm_fired:
+                mdl, thr, fit_s, _ = retrain_with_validation(X_pool, y_pool)
+                current["trigger_based"] = (mdl, thr)
+                current["trigger_retrain_count"] += 1
+                print(f"  [chunk {c:02d}] TRIGGER: domain AUC={cur_dom_auc:.4f} > {alarm_threshold:.4f}, "
+                      f"retrain #{current['trigger_retrain_count']} ({fit_s:.1f}s)")
+            else:
+                print(f"  [chunk {c:02d}] no trigger: domain AUC={cur_dom_auc:.4f} <= {alarm_threshold:.4f}")
+
             # periodic_weighted: full history + up-weighted positives
+            pool_chunks_w = chunk_nums[: chunk_nums.index(c)]
+            X_pool_w, y_pool_w = build_pool(encoded, pool_chunks_w)
             mdl, thr, fit_s, _ = retrain_with_validation(
-                X_pool, y_pool, weight_mult=WEIGHT_BOOST)
+                X_pool_w, y_pool_w, weight_mult=WEIGHT_BOOST)
             current["periodic_weighted"] = (mdl, thr)
             print(f"  [chunk {c:02d}] retrained periodic_weighted "
                   f"(boost={WEIGHT_BOOST}) ({fit_s:.1f}s)")
