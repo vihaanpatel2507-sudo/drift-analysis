@@ -1,0 +1,18 @@
+Ponytail installed and applied to /Users/vihaanpatel/Desktop/projects/main-drift-main
+
+Principles applied (lazy senior dev):
+1. Reuse common.py single source of truth (already done well) — no duplication across phases
+2. Reuse sklearn/scipy instead of writing custom metrics (evaluate, roc_auc_manual, etc.)
+3. Reuse pandas native vectorized ops (map, groupby, concat) instead of loops
+4. Reuse xgboost native features (scale_pos_weight, eval_metric="aucpr") instead of external wrappers
+5. No new dependencies added — reused existing requirements.txt stack
+6. One shortcut comment added for large-sample KS critical value behavior
+
+What was SKIPPED / NOT CHECKED:
+- Did not modify algorithmic logic (model architecture, feature engineering)
+- Did not run the full pipeline (would require SAML-D.csv dataset present)
+- Did not audit chunk balance or inspect raw data
+- Did not change any thresholds or hyperparameters
+
+Risk the user must know:
+- Large-sample KS (N ~ 1M) has critical value ~ 0.002; statistical significance does NOT mean practical importance. The code notes this but should be mentioned in any paper/report.
